@@ -20,7 +20,8 @@ class CollocationSolverND:
     def compile(self, layer_sizes, f_model_list, domain, bcs, isAdaptive=False,
                 dict_adaptive=None, init_weights=None, g=None, dist=False,
                 u_model_switch=1, two_output=False, none_zero = False, adapt_True = False,
-                MTL_adapt = False, PCGrad_true = False, Boundary_true = True, R_range = [],theta_range = []):
+                MTL_adapt = False, PCGrad_true = False, Boundary_true = True, R_range = [],theta_range = [],
+                bc_switch=1, num_freq=4, embed_dim=64):
         """
         Args:
             layer_sizes: A list of layer sizes, can be overwritten via resetting u_model to a keras model
@@ -98,6 +99,19 @@ class CollocationSolverND:
             self.R_range = R_range
             self.theta_range = theta_range
             self.u_model = new_neural_period_polar_exactBC(self.layer_sizes,[self.bcs[0].val,self.bcs[1].val],self.R_range, self.theta_range)
+
+        elif self.u_model_switch == 13:
+            self.R_range = R_range
+            self.theta_range = theta_range
+            self.bc_switch = bc_switch
+            self.num_freq = num_freq
+            self.embed_dim = embed_dim
+            self.u_model = new_neural_fourier_decoupled(
+                self.layer_sizes,
+                [self.bcs[0].val, self.bcs[1].val],
+                self.R_range, self.theta_range,
+                bc_switch=bc_switch, num_freq=num_freq, embed_dim=embed_dim
+            )
 
         self.PCGrad_true = PCGrad_true#True
         self.Boundary_true = Boundary_true
