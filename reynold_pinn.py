@@ -10,6 +10,12 @@ import os
 # 获取脚本所在目录
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
+# 输出目录 —— 所有训练结果集中存放
+OUTPUT_DIR = os.path.join(SCRIPT_DIR, "output")
+CHECKPOINT_DIR = os.path.join(OUTPUT_DIR, "checkpoints")
+MODEL_DIR = os.path.join(OUTPUT_DIR, "models")
+FIGURE_DIR = os.path.join(OUTPUT_DIR, "figures")
+
 import numpy as np
 import tensorflow as tf
 import matplotlib.ticker
@@ -430,25 +436,32 @@ def main():
         R_range=params['R_lim'], theta_range=params['theta_lim']
     )
 
-    model.best_weights_path = os.path.join(SCRIPT_DIR, 'epochs_best_model')
+    # 创建输出目录结构
+    for d in [OUTPUT_DIR, CHECKPOINT_DIR, MODEL_DIR, FIGURE_DIR]:
+        os.makedirs(d, exist_ok=True)
+
+    model.best_weights_path = os.path.join(CHECKPOINT_DIR, 'epochs_best_model')
     model.u_model.save_weights(model.best_weights_path)  # 重新初始化到正确位置
-    
+
     # 设置额外模型
     model.f_model_FB = tf.function(f_model_FB)
     model.f_model_list = [get_tf_model(f_model_FBNS)]
-    
+
     # 训练
     print("Starting training...")
     model = train_model(model, cfg, N_f_true)
-    
-    # 保存模型
+
+    # 保存模型到 output/models/
     model_name = f'reynolds_pinn_N{cfg.N_f}_iter{cfg.N_train*cfg.NL_train*4}'
-    model_path = os.path.join(SCRIPT_DIR, model_name)
+    model_path = os.path.join(MODEL_DIR, model_name)
     model.save(model_path)
     print(f"Model saved as: {model_path}")
-    
-    # 可视化结果
-    plot_results(model, params, cfg, save_prefix=model_path)
+
+    # 保存可视化到 output/figures/{model_name}/
+    fig_dir = os.path.join(FIGURE_DIR, model_name)
+    os.makedirs(fig_dir, exist_ok=True)
+    fig_prefix = os.path.join(fig_dir, model_name)
+    plot_results(model, params, cfg, save_prefix=fig_prefix)
     
     return model
 

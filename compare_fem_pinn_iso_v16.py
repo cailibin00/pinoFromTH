@@ -34,10 +34,10 @@ def _p(filename):
     return os.path.join(_HERE, filename)
 
 class Args:
-    model_path = _p("epochs_best_model")
+    model_path = _p("output/checkpoints/epochs_best_model")
     fem_p      = _p("p_FBNS.txt")
     fem_g      = _p("g_FBNS.txt")
-    out_dir    = _p("comparison_results")
+    out_dir    = _p("output/comparison_results")
     n_grid     = 201
     dpi        = 300
 
