@@ -1,0 +1,31 @@
+result*/
+checkpoint
+# 1. Python 缓存和编译文件 (必须屏蔽，否则每次运行都会提示文件被修改)
+__pycache__/
+*.py[cod]
+*$py.class
+
+# 2. PyCharm 配置文件 (你在服务器和本地的IDE配置肯定不同，传上去会互相覆盖报错)
+.idea/
+
+# 3. 虚拟环境文件夹 (绝对不能传，环境应该通过 requirements.txt 重新安装)
+venv/
+env/
+.env
+
+# 4. Jupyter Notebook 缓存
+.ipynb_checkpoints/
+
+# 5. 大型数据文件和模型权重 (GitHub 限制单个文件 100MB，大文件传上去会直接报错卡死)
+*.csv
+*.tsv
+*.dat
+*.pt
+*.pth
+*.h5
+datasets/
+checkpoints/
+logs/
+
+# 6. 系统自动生成的隐藏文件
+.DS_Store
