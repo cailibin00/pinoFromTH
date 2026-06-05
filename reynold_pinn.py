@@ -544,7 +544,7 @@ def main():
     for d in [OUTPUT_DIR, CHECKPOINT_DIR, MODEL_DIR, FIGURE_DIR]:
         os.makedirs(d, exist_ok=True)
 
-    model.best_weights_path = os.path.join(CHECKPOINT_DIR, 'epochs_best_model')
+    model.best_weights_path = os.path.join(CHECKPOINT_DIR, 'epochs_best_model.weights.h5')
     model.u_model.save_weights(model.best_weights_path)  # 重新初始化到正确位置
 
     # 设置额外模型

@@ -136,7 +136,7 @@ class CollocationSolverND:
 
         self.adaptive_constant_func_list = []
         self.loss_value_min = 1.e12
-        self.best_weights_path = 'epochs_best_model'  # 默认值，可被外部覆盖
+        self.best_weights_path = 'epochs_best_model.weights.h5'  # 默认值，可被外部覆盖
         self.u_model.save_weights(self.best_weights_path)  # 初始
         #######################################
         n_x, n_y = (101, 101)
