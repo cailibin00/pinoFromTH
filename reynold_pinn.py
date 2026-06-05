@@ -62,7 +62,7 @@ class Config:
     domain_fidelity = 50   # 域网格密度
     
     # 训练参数
-    layer_sizes = [2, 128, 256, 256, 128,128 ,2]
+    layer_sizes = [2, 128, 128, 128, 128,128 ,2]
     N_train = 5000         # 每阶段训练迭代数
     NL_train = 4           # RAD细化轮数
     ratio_RAD_list = [0.03, 0.01]  # RAD采样比例

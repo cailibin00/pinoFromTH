@@ -606,8 +606,8 @@ class CollocationSolverND:
             for j in range(num_tasks):
                 start_idx = 0
                 for idx, var in enumerate(self.variables):
-                    grad_shape = var.get_shape()
-                    flatten_dim = np.prod([grad_shape.dims[i].value for i in range(len(grad_shape.dims))])
+                    grad_shape = var.shape
+                    flatten_dim = int(np.prod(grad_shape))
                     proj_grad = proj_grads_flatten[j][start_idx:start_idx + flatten_dim]
                     proj_grad = tf.reshape(proj_grad, grad_shape)
                     if len(proj_grads) < len(self.variables):
