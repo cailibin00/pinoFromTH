@@ -825,13 +825,12 @@ def new_neural_fourier_decoupled(layer_sizes, bc_values, r_lim, theta_lim,
             P = tanh(P_raw)², γ = tanh(γ_raw)²
             (Boundary conditions enforced purely through loss terms)
     """
+    kops = tf.keras.ops
     inputs = tf.keras.Input(shape=(2,))
 
     # ── Coordinate extraction ──────────────────────────────────────────
-    kernel_r = tf.constant([[1.0], [0.0]], dtype=tf.float32)
-    kernel_theta = tf.constant([[0.0], [1.0]], dtype=tf.float32)
-    inputs_r = tf.matmul(inputs, kernel_r)
-    inputs_theta = tf.matmul(inputs, kernel_theta)
+    inputs_r = layers.Lambda(lambda x: x[:, 0:1])(inputs)
+    inputs_theta = layers.Lambda(lambda x: x[:, 1:2])(inputs)
 
     # ── Normalization to [-1, 1] ───────────────────────────────────────
     R_norm = 2.0 * (inputs_r - r_lim[0]) / (r_lim[1] - r_lim[0]) - 1.0
@@ -841,37 +840,37 @@ def new_neural_fourier_decoupled(layer_sizes, bc_values, r_lim, theta_lim,
     R_ff_list, theta_ff_list = [], []
     for i in range(num_freq):
         freq = (2 ** i) * np.pi
-        R_ff_list.append(tf.sin(freq * R_norm))
-        R_ff_list.append(tf.cos(freq * R_norm))
-        theta_ff_list.append(tf.sin(freq * theta_norm))
-        theta_ff_list.append(tf.cos(freq * theta_norm))
-    R_ff = tf.concat(R_ff_list, axis=1)          # (batch, 2*num_freq)
-    theta_ff = tf.concat(theta_ff_list, axis=1)  # (batch, 2*num_freq)
+        R_ff_list.append(kops.sin(freq * R_norm))
+        R_ff_list.append(kops.cos(freq * R_norm))
+        theta_ff_list.append(kops.sin(freq * theta_norm))
+        theta_ff_list.append(kops.cos(freq * theta_norm))
+    R_ff = layers.Concatenate(axis=1)(R_ff_list)          # (batch, 2*num_freq)
+    theta_ff = layers.Concatenate(axis=1)(theta_ff_list)  # (batch, 2*num_freq)
 
     # ── R MLP: Fourier features → 32 → embed_dim ──────────────────────
-    r_h = layers.Dense(32, activation=tf.nn.tanh,
+    r_h = layers.Dense(32, activation='tanh',
                        kernel_initializer="glorot_normal")(R_ff)
-    R_embed = layers.Dense(embed_dim, activation=tf.nn.tanh,
+    R_embed = layers.Dense(embed_dim, activation='tanh',
                            kernel_initializer="glorot_normal")(r_h)
 
     # ── θ MLP: Fourier features → 32 → embed_dim ──────────────────────
-    t_h = layers.Dense(32, activation=tf.nn.tanh,
+    t_h = layers.Dense(32, activation='tanh',
                        kernel_initializer="glorot_normal")(theta_ff)
-    theta_embed = layers.Dense(embed_dim, activation=tf.nn.tanh,
+    theta_embed = layers.Dense(embed_dim, activation='tanh',
                                kernel_initializer="glorot_normal")(t_h)
 
     # ── Concatenate decoupled embeddings ──────────────────────────────
-    x = tf.concat([R_embed, theta_embed], axis=1)  # (batch, 2*embed_dim)
+    x = layers.Concatenate(axis=1)([R_embed, theta_embed])  # (batch, 2*embed_dim)
 
     # ── Main Network with U/V branching ───────────────────────────────
-    x_U = layers.Dense(layer_sizes[2], activation=tf.nn.tanh,
+    x_U = layers.Dense(layer_sizes[2], activation='tanh',
                        kernel_initializer="glorot_normal")(x)
-    x_V = layers.Dense(layer_sizes[2], activation=tf.nn.tanh,
+    x_V = layers.Dense(layer_sizes[2], activation='tanh',
                        kernel_initializer="glorot_normal")(x)
 
     for width in layer_sizes[2:-1]:
-        x_t = layers.Dense(width, activation=tf.nn.tanh,
-                          kernel_initializer="glorot_normal")(x)
+        x_t = layers.Dense(width, activation='tanh',
+                           kernel_initializer="glorot_normal")(x)
         x = x_t * x_U + (1 - x_t) * x_V
 
     # ── Output heads ──────────────────────────────────────────────────
@@ -887,18 +886,18 @@ def new_neural_fourier_decoupled(layer_sizes, bc_values, r_lim, theta_lim,
         # === Improved Hard BC ===
         # g_mlp: small MLP that learns the R→P_baseline mapping from data.
         # No restrictive atanh-sqrt-linear prior.
-        g_h = layers.Dense(8, activation=tf.nn.tanh,
-                          kernel_initializer="glorot_normal")(R_norm)
-        g_h = layers.Dense(8, activation=tf.nn.tanh,
-                          kernel_initializer="glorot_normal")(g_h)
+        g_h = layers.Dense(8, activation='tanh',
+                           kernel_initializer="glorot_normal")(R_norm)
+        g_h = layers.Dense(8, activation='tanh',
+                           kernel_initializer="glorot_normal")(g_h)
         g_func = layers.Dense(1, activation=None,
-                             kernel_initializer="glorot_normal")(g_h)
+                              kernel_initializer="glorot_normal")(g_h)
 
         # Plateau σ(R): 1 in interior, smooth decay to 0 only near boundaries.
         # Uses Hermite cubic for C¹ smoothness, transition width = 3% of domain.
         transition = 0.03
-        t_left = tf.clip_by_value((R_norm + 1.0) / transition, 0.0, 1.0)
-        t_right = tf.clip_by_value((1.0 - R_norm) / transition, 0.0, 1.0)
+        t_left = kops.clip((R_norm + 1.0) / transition, 0.0, 1.0)
+        t_right = kops.clip((1.0 - R_norm) / transition, 0.0, 1.0)
         sigma_func = ((3 * t_left**2 - 2 * t_left**3) *
                       (3 * t_right**2 - 2 * t_right**3))
 
@@ -914,8 +913,8 @@ def new_neural_fourier_decoupled(layer_sizes, bc_values, r_lim, theta_lim,
         raise ValueError(f"bc_switch must be 1 or 2, got {bc_switch}")
 
     # ── Final non-negative activation ─────────────────────────────────
-    P = (tf.nn.tanh(P_raw)) ** 2
-    gamma = (tf.nn.tanh(gamma_raw)) ** 2
+    P = kops.square(kops.tanh(P_raw))
+    gamma = kops.square(kops.tanh(gamma_raw))
 
     model = tf.keras.Model(inputs=inputs, outputs=[P, gamma])
     return model

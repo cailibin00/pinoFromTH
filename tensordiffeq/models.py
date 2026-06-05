@@ -38,9 +38,9 @@ class CollocationSolverND:
         Returns:
             None
         """
-        self.tf_optimizer = tf.keras.optimizers.Adam(lr=0.001, beta_1=.99)
-        self.tf_optimizer_2 = tf.keras.optimizers.Adam(lr=0.001, beta_1=.99)
-        self.tf_optimizer_weights = tf.keras.optimizers.Adam(lr=0.0005, beta_1=.99)
+        self.tf_optimizer = tf.keras.optimizers.Adam(learning_rate=0.001, beta_1=.99)
+        self.tf_optimizer_2 = tf.keras.optimizers.Adam(learning_rate=0.001, beta_1=.99)
+        self.tf_optimizer_weights = tf.keras.optimizers.Adam(learning_rate=0.0005, beta_1=.99)
         self.layer_sizes = layer_sizes
         #self.sizes_w, self.sizes_b = get_sizes(layer_sizes)
         self.bcs = bcs
@@ -664,8 +664,8 @@ class CollocationSolverND:
 
             with self.strategy.scope():
                 self.u_model = neural_net(self.layer_sizes)
-                self.tf_optimizer = tf.keras.optimizers.Adam(lr=0.005, beta_1=.99)
-                self.tf_optimizer_weights = tf.keras.optimizers.Adam(lr=0.005, beta_1=.99)
+                self.tf_optimizer = tf.keras.optimizers.Adam(learning_rate=0.005, beta_1=.99)
+                self.tf_optimizer_weights = tf.keras.optimizers.Adam(learning_rate=0.005, beta_1=.99)
                 # self.dist_col_weights = tf.Variable(tf.zeros(batch_sz), validate_shape=True)
 
 
