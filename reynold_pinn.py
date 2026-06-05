@@ -229,8 +229,14 @@ def create_pde_models(H_func, params, cfg: Config = None):
         p_R = tf.gradients(p, R)[0]
         p_theta = tf.gradients(p, theta)[0]
 
-        # ── 方法A: stop_gradient 截断楔形项中 H 的梯度 ──────────
-        H_for_wedge = tf.stop_gradient(H) if use_sg else H
+        # ── 方法A: stop_gradient 截断楔形项中 H 的参数梯度 ──────────
+        # 不能直接对 H 整体 stop_gradient 后再对 theta 求导，
+        # 否则 tf.gradients(H_for_wedge, theta) 会返回 None。
+        H_theta = tf.gradients(H, theta)[0]
+        H_mult = H
+        if use_sg:
+            H_theta = tf.stop_gradient(H_theta)
+            H_mult = tf.stop_gradient(H)
 
         # Poiseuille 扩散 (始终使用完整 H, 不受 stop_gradient 影响)
         part_1 = tf.gradients(R * H**3 * p_R, R)[0] / R
@@ -238,12 +244,14 @@ def create_pde_models(H_func, params, cfg: Config = None):
 
         # ── 方法B: 课程权重 w_wedge ──────────────────────────────
         w = w_wedge_var
-        # 楔形效应项 (使用 stop_gradient 版本的 H)
-        part_3_1 = -Lambda * tf.gradients(H_for_wedge, theta)[0] * w
-        part_3_2 = -Lambda * tf.gradients(-gamma * H_for_wedge, theta)[0] * w
+        gamma_theta = tf.gradients(gamma, theta)[0]
+
+        # 楔形效应项
+        part_3_1 = -Lambda * H_theta * w
+        part_3_2 = -Lambda * (-(gamma_theta * H_mult + gamma * H_theta)) * w
 
         # 稳定项 (处理空化边界)
-        div_gamma = tf.gradients(gamma, theta)[0]
+        div_gamma = gamma_theta
         div_2_gamma = tf.gradients(div_gamma, theta)[0]
         div_p = tf.gradients(p, theta)[0]
 
