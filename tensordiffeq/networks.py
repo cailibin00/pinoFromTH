@@ -807,71 +807,66 @@ def new_neural_fourier_decoupled(layer_sizes, bc_values, r_lim, theta_lim,
                                   bc_switch=1, num_freq=4, embed_dim=64):
     """
     Decoupled Fourier feature encoding with separate MLPs for R and θ.
-
-    Architecture:
-        Input [R, θ]
-        ├─ R: normalize → Fourier(sin/cos) → MLP_R(32,embed_dim) → R_embed
-        └─ θ: normalize → Fourier(sin/cos) → MLP_θ(32,embed_dim) → θ_embed
-        Concat(R_embed, θ_embed) → Main Network (U/V branching) → [P_raw, γ_raw]
-
-        bc_switch=1 (Improved Hard BC):
-            g_mlp(R): small MLP learning R→baseline mapping (replaces old
-                      atanh-linear-interpolation prior)
-            σ(R): plateau-type distance function — stays ≈1 across interior,
-                  smoothly decays to 0 only within 3% of each boundary
-            P = tanh(g_mlp(R) + σ(R)·P_raw)²
-
-        bc_switch=2 (Soft BC only):
-            P = tanh(P_raw)², γ = tanh(γ_raw)²
-            (Boundary conditions enforced purely through loss terms)
+    Keras 3 compatible: all TensorFlow ops on symbolic tensors are wrapped
+    inside Keras layers/Lambda.
     """
-    kops = tf.keras.ops
     inputs = tf.keras.Input(shape=(2,))
 
     # ── Coordinate extraction ──────────────────────────────────────────
-    inputs_r = layers.Lambda(lambda x: x[:, 0:1])(inputs)
-    inputs_theta = layers.Lambda(lambda x: x[:, 1:2])(inputs)
+    inputs_r = layers.Lambda(lambda x: x[:, 0:1], name="extract_r")(inputs)
+    inputs_theta = layers.Lambda(lambda x: x[:, 1:2], name="extract_theta")(inputs)
 
     # ── Normalization to [-1, 1] ───────────────────────────────────────
-    R_norm = 2.0 * (inputs_r - r_lim[0]) / (r_lim[1] - r_lim[0]) - 1.0
-    theta_norm = 2.0 * (inputs_theta - theta_lim[0]) / (theta_lim[1] - theta_lim[0]) - 1.0
+    R_norm = layers.Lambda(
+        lambda x: 2.0 * (x - r_lim[0]) / (r_lim[1] - r_lim[0]) - 1.0,
+        name="normalize_r"
+    )(inputs_r)
+    theta_norm = layers.Lambda(
+        lambda x: 2.0 * (x - theta_lim[0]) / (theta_lim[1] - theta_lim[0]) - 1.0,
+        name="normalize_theta"
+    )(inputs_theta)
 
-    # ── Fourier Feature Encoding (NeRF-style per-coordinate) ───────────
+    # ── Fourier Feature Encoding ───────────────────────────────────────
     R_ff_list, theta_ff_list = [], []
     for i in range(num_freq):
-        freq = (2 ** i) * np.pi
-        R_ff_list.append(kops.sin(freq * R_norm))
-        R_ff_list.append(kops.cos(freq * R_norm))
-        theta_ff_list.append(kops.sin(freq * theta_norm))
-        theta_ff_list.append(kops.cos(freq * theta_norm))
-    R_ff = layers.Concatenate(axis=1)(R_ff_list)          # (batch, 2*num_freq)
-    theta_ff = layers.Concatenate(axis=1)(theta_ff_list)  # (batch, 2*num_freq)
+        freq = float((2 ** i) * np.pi)
+        R_ff_list.append(layers.Lambda(lambda x, f=freq: tf.sin(f * x))(R_norm))
+        R_ff_list.append(layers.Lambda(lambda x, f=freq: tf.cos(f * x))(R_norm))
+        theta_ff_list.append(layers.Lambda(lambda x, f=freq: tf.sin(f * x))(theta_norm))
+        theta_ff_list.append(layers.Lambda(lambda x, f=freq: tf.cos(f * x))(theta_norm))
 
-    # ── R MLP: Fourier features → 32 → embed_dim ──────────────────────
-    r_h = layers.Dense(32, activation='tanh',
-                       kernel_initializer="glorot_normal")(R_ff)
-    R_embed = layers.Dense(embed_dim, activation='tanh',
-                           kernel_initializer="glorot_normal")(r_h)
+    R_ff = layers.Concatenate(axis=1, name="fourier_r")(R_ff_list)
+    theta_ff = layers.Concatenate(axis=1, name="fourier_theta")(theta_ff_list)
 
-    # ── θ MLP: Fourier features → 32 → embed_dim ──────────────────────
-    t_h = layers.Dense(32, activation='tanh',
-                       kernel_initializer="glorot_normal")(theta_ff)
-    theta_embed = layers.Dense(embed_dim, activation='tanh',
-                               kernel_initializer="glorot_normal")(t_h)
+    # ── R / θ encoders ────────────────────────────────────────────────
+    r_h = layers.Dense(32, activation='tanh', kernel_initializer="glorot_normal")(R_ff)
+    R_embed = layers.Dense(embed_dim, activation='tanh', kernel_initializer="glorot_normal")(r_h)
 
-    # ── Concatenate decoupled embeddings ──────────────────────────────
-    x = layers.Concatenate(axis=1)([R_embed, theta_embed])  # (batch, 2*embed_dim)
+    t_h = layers.Dense(32, activation='tanh', kernel_initializer="glorot_normal")(theta_ff)
+    theta_embed = layers.Dense(embed_dim, activation='tanh', kernel_initializer="glorot_normal")(t_h)
+
+    x = layers.Concatenate(axis=1, name="merge_embed")([R_embed, theta_embed])
 
     # ── Main Network with U/V branching ───────────────────────────────
-    x_U = layers.Dense(layer_sizes[2], activation='tanh',
-                       kernel_initializer="glorot_normal")(x)
-    x_V = layers.Dense(layer_sizes[2], activation='tanh',
-                       kernel_initializer="glorot_normal")(x)
+    base_width = layer_sizes[2]
+    x_U = layers.Dense(base_width, activation='tanh', kernel_initializer="glorot_normal")(x)
+    x_V = layers.Dense(base_width, activation='tanh', kernel_initializer="glorot_normal")(x)
+    x = layers.Dense(base_width, activation='tanh', kernel_initializer="glorot_normal")(x)
 
     for width in layer_sizes[2:-1]:
-        x_t = layers.Dense(width, activation='tanh',
-                           kernel_initializer="glorot_normal")(x)
-        x = x_t * x_U + (1 - x_t) * x_V
+        if x.shape[-1] != width:
+            x = layers.Dense(width, activation='tanh', kernel_initializer="glorot_normal")(x)
+            x_U_cur = layers.Dense(width, activation='tanh', kernel_initializer="glorot_normal")(x_U)
+            x_V_cur = layers.Dense(width, activation='tanh', kernel_initializer="glorot_normal")(x_V)
+        else:
+            x_U_cur = x_U
+            x_V_cur = x_V
+
+        gate = layers.Dense(width, activation='sigmoid', kernel_initializer="glorot_normal")(x)
+        left = layers.Multiply()([gate, x_U_cur])
+        right_gate = layers.Lambda(lambda z: 1.0 - z)(gate)
+        right = layers.Multiply()([right_gate, x_V_cur])
+        x = layers.Add()([left, right])
 
     # ── Output heads ──────────────────────────────────────────────────
     nn_P = layers.Dense(1, activation=None, use_bias=True,
@@ -883,38 +878,37 @@ def new_neural_fourier_decoupled(layer_sizes, bc_values, r_lim, theta_lim,
 
     # ── Boundary condition handling ───────────────────────────────────
     if bc_switch == 1:
-        # === Improved Hard BC ===
-        # g_mlp: small MLP that learns the R→P_baseline mapping from data.
-        # No restrictive atanh-sqrt-linear prior.
-        g_h = layers.Dense(8, activation='tanh',
-                           kernel_initializer="glorot_normal")(R_norm)
-        g_h = layers.Dense(8, activation='tanh',
-                           kernel_initializer="glorot_normal")(g_h)
-        g_func = layers.Dense(1, activation=None,
-                              kernel_initializer="glorot_normal")(g_h)
+        g_h = layers.Dense(8, activation='tanh', kernel_initializer="glorot_normal")(R_norm)
+        g_h = layers.Dense(8, activation='tanh', kernel_initializer="glorot_normal")(g_h)
+        g_func = layers.Dense(1, activation=None, kernel_initializer="glorot_normal")(g_h)
 
-        # Plateau σ(R): 1 in interior, smooth decay to 0 only near boundaries.
-        # Uses Hermite cubic for C¹ smoothness, transition width = 3% of domain.
         transition = 0.03
-        t_left = kops.clip((R_norm + 1.0) / transition, 0.0, 1.0)
-        t_right = kops.clip((1.0 - R_norm) / transition, 0.0, 1.0)
-        sigma_func = ((3 * t_left**2 - 2 * t_left**3) *
-                      (3 * t_right**2 - 2 * t_right**3))
+        t_left = layers.Lambda(
+            lambda x: tf.clip_by_value((x + 1.0) / transition, 0.0, 1.0),
+            name="clip_left"
+        )(R_norm)
+        t_right = layers.Lambda(
+            lambda x: tf.clip_by_value((1.0 - x) / transition, 0.0, 1.0),
+            name="clip_right"
+        )(R_norm)
+        sigma_func = layers.Lambda(
+            lambda xs: (3.0 * xs[0] ** 2 - 2.0 * xs[0] ** 3) *
+                       (3.0 * xs[1] ** 2 - 2.0 * xs[1] ** 3),
+            name="sigma_func"
+        )([t_left, t_right])
 
-        P_raw = g_func + sigma_func * nn_P
+        sigma_nn = layers.Multiply()([sigma_func, nn_P])
+        P_raw = layers.Add()([g_func, sigma_nn])
         gamma_raw = nn_gamma
 
     elif bc_switch == 2:
-        # === Soft BC: boundary values enforced only through loss ===
         P_raw = nn_P
         gamma_raw = nn_gamma
-
     else:
         raise ValueError(f"bc_switch must be 1 or 2, got {bc_switch}")
 
-    # ── Final non-negative activation ─────────────────────────────────
-    P = kops.square(kops.tanh(P_raw))
-    gamma = kops.square(kops.tanh(gamma_raw))
+    P = layers.Lambda(lambda x: tf.square(tf.tanh(x)), name="P_output")(P_raw)
+    gamma = layers.Lambda(lambda x: tf.square(tf.tanh(x)), name="gamma_output")(gamma_raw)
 
     model = tf.keras.Model(inputs=inputs, outputs=[P, gamma])
     return model
