@@ -716,7 +716,7 @@ class Coslayer_normalization(layers.Layer):
                              'should be defined. Found `None`.')
 
         self.kernel = self.add_weight(
-            'kernel_cos',
+            name='kernel_cos',
             shape=[last_dim, self.units],
             initializer=self.kernel_initializer,
             regularizer=self.kernel_regularizer,
@@ -729,7 +729,7 @@ class Coslayer_normalization(layers.Layer):
             dtype=self.dtype)#2*
 
         self.phy = self.add_weight(
-            'phy_cos',
+            name='phy_cos',
             shape=[self.units, ],
             initializer=self.kernel_initializer,
             regularizer=self.kernel_regularizer,
@@ -741,7 +741,7 @@ class Coslayer_normalization(layers.Layer):
 
         if self.use_bias:
             self.bias = self.add_weight(
-                'bias_cos',
+                name='bias_cos',
                 shape=[self.units, ],
                 initializer=self.bias_initializer,
                 regularizer=self.bias_regularizer,
