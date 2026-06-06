@@ -62,28 +62,15 @@ class Config:
     domain_fidelity = 50   # 域网格密度
     
     # 训练参数
-    layer_sizes = [2, 128, 128, 128, 128,128 ,2]
+    layer_sizes = [2, 128, 128, 128, 128, 128, 2]
     N_train = 5000         # 每阶段训练迭代数
     NL_train = 4           # RAD细化轮数
     ratio_RAD_list = [0.03, 0.01]  # RAD采样比例
 
-    # ── 模型架构开关 ─────────────────────────────────────────────────
+    # ── 模型架构 ─────────────────────────────────────────────────────
     u_model_switch = 13    # 8=旧极坐标硬BC, 13=新Fourier解耦架构
-    bc_switch = 1          # 1=改进硬BC(MLP_g+plateau σ), 2=纯软约束
-    num_fourier_freq = 4   # 每坐标Fourier特征频率数 (2^0, 2^1, ..., 2^{L-1})·π
-    embed_dim = 64         # R/θ MLP编码输出维度
-
-    # ── 膜厚过渡类型 ─────────────────────────────────────────────────
-    h_step_type = 'hermite'  # 'sigmoid' | 'hermite' | 'relu'
-                             # hermite: C¹分段三次, 精确0/1在过渡区外
-                             # sigmoid: C∞但过渡模糊 (旧行为)
-                             # relu:    C⁰锐利, 导数只有一点不连续
-
-    # ── 楔形项课程学习 (w_wedge 从 0→1 阶梯上升) ───────────────────
-    w_wedge_init = 1e-2
-    w_wedge_final = 1.0
-    use_stop_gradient_H = True   # 截断楔形项中H的梯度 (方法A)
-    use_point_weight = True      # 按|∂H/∂θ|逐点降权 (方法C)
+    num_fourier_freq = 4   # Fourier特征频率数
+    embed_dim = 64         # R/θ 编码输出维度
     
     # 绘图参数
     dpi_save = 600
@@ -138,10 +125,7 @@ def compute_physical_params(cfg: Config):
 def create_H_func(params, cfg: Config):
     """创建膜厚函数 H(R, theta)
 
-    支持三种过渡类型 (cfg.h_step_type):
-        'hermite' — C¹分段三次多项式, 在过渡区外精确为0/1 (推荐)
-        'sigmoid' — C∞光滑, 但过渡区模糊 (旧行为)
-        'relu'    — C⁰锐利裁剪, 梯度更集中
+    使用 C¹ 分段三次 Hermite 平滑过渡, 过渡区外精确为 0/1.
     """
     R_d_1 = params['R_d_1']
     R_d_2 = params['R_d_2']
@@ -152,35 +136,23 @@ def create_H_func(params, cfg: Config):
     groove_ratio = params['groove_ratio']
     K_val = float(params['K'].numpy())
 
-    # 平滑参数
-    N_xi = 50.0
+    # 平滑参数 (过渡区宽度)
     R_xi = 100.0
     xi_R = (params['R_lim'][1] - params['R_lim'][0]) / R_xi
-    xi_theta = (params['theta_lim'][1] - params['theta_lim'][0]) / N_xi
-    theta_offset = np.pi / 6  # 30度相位偏移
-
-    step_type = getattr(cfg, 'h_step_type', 'sigmoid')
+    xi_theta = (params['theta_lim'][1] - params['theta_lim'][0]) / 50.0
+    theta_offset = np.pi / 6
 
     def _step_fn(x):
-        """过渡函数, 根据 step_type 选择"""
-        if step_type == 'hermite':
-            # C¹ 分段三次 Hermite: h(t)=3t²-2t³ for t∈[0,1]
-            t = tf.clip_by_value(x, 0.0, 1.0)
-            return 3 * t**2 - 2 * t**3
-        elif step_type == 'relu':
-            # C⁰ 锐利裁剪
-            return tf.clip_by_value(x, 0.0, 1.0)
-        else:
-            # sigmoid (旧行为)
-            return tf.math.sigmoid(x)
+        """Hermite 三次: h(t)=3t²-2t³, t∈[0,1]. C¹ 光滑."""
+        t = tf.clip_by_value(x, 0.0, 1.0)
+        return 3 * t**2 - 2 * t**3
 
     def theta_sym(R):
         """螺旋线方程"""
-        return tf.math.log(R / r_g) / tf.math.tan(alpha)+theta_offset
+        return tf.math.log(R / r_g) / tf.math.tan(alpha) + theta_offset
 
     def H_func(R, theta):
         """膜厚分布函数"""
-        # 螺旋槽区域判断
         periodic_offsets = [0, -2*np.pi/K_val, -4*np.pi/K_val, 2*np.pi/K_val, 4*np.pi/K_val]
         periodic_terms = []
         for offset in periodic_offsets:
@@ -201,57 +173,29 @@ def create_H_func(params, cfg: Config):
 # =============================================================================
 # 4. PDE残差模型
 # =============================================================================
-def create_pde_models(H_func, params, cfg: Config = None):
-    """创建PDE残差函数
-
-    方法ABC组合控梯策略:
-        A. stop_gradient(H) 用于楔形项, 截断 ∂H/∂θ 对网络参数的梯度
-        B. w_wedge 课程权重 (初值~1e-2 → 终值1.0), 先学扩散后学楔形
-        C. 逐点权重 ∝ 1/(1+|∂H/∂θ|/mean), 自动压低槽边界处的残差量级
-    """
+def create_pde_models(H_func, params):
+    """创建 PDE 残差函数 (简洁版)"""
     Lambda = params['Lambda']
 
-    # 可调控件
-    use_sg = getattr(cfg, 'use_stop_gradient_H', True)
-    use_pw = getattr(cfg, 'use_point_weight', True)
-    w_wedge_var = tf.Variable(
-        getattr(cfg, 'w_wedge_init', 1e-2),
-        trainable=False, dtype=tf.float32
-    )
-
     def f_model_FBNS(u_model, R, theta):
-        """Reynolds方程残差 + JFO稳定项 (ABC组合)"""
+        """Reynolds 方程残差 + JFO 稳定项"""
         p_vector = u_model(tf.concat([R, theta], 1))
         p, gamma = p_vector[0], p_vector[1]
         H = H_func(R, theta)
 
-        # 压力梯度
         p_R = tf.gradients(p, R)[0]
         p_theta = tf.gradients(p, theta)[0]
 
-        # ── 方法A: stop_gradient 截断楔形项中 H 的参数梯度 ──────────
-        # 不能直接对 H 整体 stop_gradient 后再对 theta 求导，
-        # 否则 tf.gradients(H_for_wedge, theta) 会返回 None。
-        H_theta = tf.gradients(H, theta)[0]
-        H_mult = H
-        if use_sg:
-            H_theta = tf.stop_gradient(H_theta)
-            H_mult = tf.stop_gradient(H)
-
-        # Poiseuille 扩散 (始终使用完整 H, 不受 stop_gradient 影响)
+        # Poiseuille 扩散项
         part_1 = tf.gradients(R * H**3 * p_R, R)[0] / R
         part_2 = tf.gradients(H**3 * p_theta, theta)[0] / R**2
 
-        # ── 方法B: 课程权重 w_wedge ──────────────────────────────
-        w = w_wedge_var
-        gamma_theta = tf.gradients(gamma, theta)[0]
-
         # 楔形效应项
-        part_3_1 = -Lambda * H_theta * w
-        part_3_2 = -Lambda * (-(gamma_theta * H_mult + gamma * H_theta)) * w
+        part_3_1 = -Lambda * tf.gradients(H, theta)[0]
+        part_3_2 = -Lambda * tf.gradients(-gamma * H, theta)[0]
 
-        # 稳定项 (处理空化边界)
-        div_gamma = gamma_theta
+        # τ 稳定化项 (空化边界数值稳定性)
+        div_gamma = tf.gradients(gamma, theta)[0]
         div_2_gamma = tf.gradients(div_gamma, theta)[0]
         div_p = tf.gradients(p, theta)[0]
 
@@ -259,35 +203,16 @@ def create_pde_models(H_func, params, cfg: Config = None):
         tau = tf.stop_gradient((tf.math.abs(div_gamma) - div_gamma) * epsilon)
         tau_2 = tf.stop_gradient((div_p - tf.math.abs(div_p)) * epsilon)
 
-        f_p_raw = part_1 + part_2 + part_3_1 + part_3_2 + div_2_gamma * tau * tau_2
-
-        # ── 方法C: 逐点权重, 压低槽边突变区的loss贡献 ───────────
-        if use_pw:
-            # 使用原始 H 计算梯度 (不被 stop_gradient 影响)
-            grad_H_theta = tf.gradients(H, theta)[0]
-            mean_grad = tf.stop_gradient(
-                tf.reduce_mean(tf.abs(grad_H_theta)) + 1e-8
-            )
-            point_weight = tf.stop_gradient(
-                1.0 / (1.0 + tf.abs(grad_H_theta) / mean_grad)
-            )
-            f_p = point_weight * f_p_raw
-        else:
-            f_p = f_p_raw
-
+        f_p = part_1 + part_2 + part_3_1 + part_3_2 + div_2_gamma * tau * tau_2
         return f_p
 
     def f_model_FB(u_model, R, theta):
-        """Fischer-Burmeister互补条件"""
+        """Fischer-Burmeister 互补条件"""
         p_vector = u_model(tf.concat([R, theta], 1))
         p, gamma = p_vector[0], p_vector[1]
         return p + gamma - tf.math.sqrt(p**2 + gamma**2)
 
-    def set_w_wedge(new_val):
-        """更新楔形项课程权重"""
-        w_wedge_var.assign(new_val)
-
-    return f_model_FBNS, f_model_FB, set_w_wedge
+    return f_model_FBNS, f_model_FB
 
 
 # =============================================================================
@@ -335,8 +260,7 @@ def generate_groove_points(theta_sym, params, cfg: Config):
 # 6. 训练流程
 # =============================================================================
 def train_model(model, cfg: Config, N_f_true):
-    """多阶段训练流程, 含 w_wedge 课程学习"""
-    # 学习率配置
+    """多阶段训练流程 (朴素版)"""
     lr_schedules = [
         {'boundaries': [20000, 40000], 'values': [1e-3, 1e-4, 1e-5]},
         {'boundaries': [20000, 40000], 'values': [1e-4, 1e-4, 1e-5]},
@@ -344,23 +268,7 @@ def train_model(model, cfg: Config, N_f_true):
         {'boundaries': [20000, 40000], 'values': [1e-5, 1e-5, 1e-6]},
     ]
 
-    # w_wedge 课程: 从 ~0.01 阶梯上升到 1.0
-    # 阶段1: 几乎纯扩散 (poiseuille), 阶段4: 满楔形效应
-    w_wedge_init = getattr(cfg, 'w_wedge_init', 1e-2)
-    w_wedge_final = getattr(cfg, 'w_wedge_final', 1.0)
-    n_stages = len(lr_schedules)
-    w_wedge_values = [
-        w_wedge_init + (w_wedge_final - w_wedge_init) * i / (n_stages - 1)
-        for i in range(n_stages)
-    ]
-
-    for stage_idx, schedule in enumerate(lr_schedules):
-        # 更新课程权重
-        if hasattr(model, 'set_w_wedge'):
-            w_val = w_wedge_values[stage_idx]
-            model.set_w_wedge(w_val)
-            print(f"[Stage {stage_idx+1}/{n_stages}] w_wedge = {w_val:.3e}")
-
+    for schedule in lr_schedules:
         lr_decay = tf.keras.optimizers.schedules.PiecewiseConstantDecay(
             boundaries=schedule['boundaries'], values=schedule['values'])
 
@@ -509,7 +417,7 @@ def main():
     
     # 创建膜厚函数和PDE模型
     H_func, theta_sym = create_H_func(params, cfg)
-    f_model_FBNS, f_model_FB, set_w_wedge = create_pde_models(H_func, params, cfg)
+    f_model_FBNS, f_model_FB = create_pde_models(H_func, params)
 
     # 创建计算域
     Domain = DomainND(["R", "theta"])
@@ -536,8 +444,7 @@ def main():
         none_zero=False, adapt_True=False,
         isAdaptive=False, MTL_adapt=False, PCGrad_true=True, Boundary_true=False,
         R_range=params['R_lim'], theta_range=params['theta_lim'],
-        bc_switch=cfg.bc_switch, num_freq=cfg.num_fourier_freq,
-        embed_dim=cfg.embed_dim
+        num_freq=cfg.num_fourier_freq, embed_dim=cfg.embed_dim
     )
 
     # 创建输出目录结构
@@ -550,7 +457,6 @@ def main():
     # 设置额外模型
     model.f_model_FB = tf.function(f_model_FB)
     model.f_model_list = [get_tf_model(f_model_FBNS)]
-    model.set_w_wedge = set_w_wedge  # w_wedge 课程调度器
 
     # 训练
     print("Starting training...")

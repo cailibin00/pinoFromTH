@@ -2,262 +2,116 @@
 
 > **日期**: 2026-06-05
 > **基于**: 原始代码 v1.1 (叶萌)
-> **改进依据**: 对原模型四个核心瓶颈的针对性修改
+> **原则**: 修改应**单一纯粹** — 输入解耦留住，其余一切从简
 
 ---
 
 ## 改进总览
 
-| 问题 | 根因 | 修改 |
-|------|------|------|
-| 边界处理 | `g_func` 只有3自由度(atanh-线性+Hermite) | `bc_switch=1`: MLP_g(R) 可学习基线 + plateau_σ(R) |
-| 膜厚平滑 | sigmoid 过渡区模糊, 且 ∂H/∂θ 梯度劫持全局更新 | ABC组合控梯策略 |
-| 输入编码 | R 只有线性投影, θ↔R 加法耦合 | R-MLP + θ-MLP 独立 Fourier 编码, concat |
-| 测评稳定 | 近零分母导致相对误差爆炸 | (见后续单独改进) |
-
-### 开关总表
-
-| 配置项 | 值 | 含义 |
-|--------|----|------|
-| `u_model_switch` | `13` | 新 Fourier 解耦架构 |
-| `bc_switch` | `1` | 改进硬 BC (MLP_g + plateau σ) |
-| `bc_switch` | `2` | 纯软约束, 放弃硬 BC |
-| `h_step_type` | `'hermite'` | C¹ 分段三次膜厚过渡 (推荐) |
-| `h_step_type` | `'relu'` | C⁰ 锐利过渡 |
-| `h_step_type` | `'sigmoid'` | C∞ 平滑 (旧行为) |
+| 问题 | 旧架构 (switch=8) | 新架构 (switch=13) |
+|------|------------------|-------------------|
+| 输入编码 | R: 单标量线性投影, θ: cos特征; 加法融合, 互相干扰 | R/θ: 独立 Fourier→MLP→concat, 信息解耦 |
+| 边界约束 | `g_func_1` (atanh-线性) + `g_func_2` (2-自由度Hermite) + 指数σ | `atanh(线性插值√P)` + `σ=1−R²`, 纯数学公式, 无可训练权重 |
+| PDE 残差 | 标准 Reynolds 方程 | 不变 (无 stop_gradient, 无课程权重, 无逐点降权) |
+| 训练 | 4阶段 LR 衰减 + RAD 重采样 | 不变 (无 w_wedge 等额外调度) |
 
 ---
 
-## 1. 输入编码：Fourier 解耦架构
+## 1. 输入编码：Fourier 解耦
 
 ### 问题
 
-旧架构 (`u_model_switch=8`) 的 Coslayer_normalization:
-- R 坐标只做 `R * kernel_1[0]` —— **单一线性投影**, 表达能力极弱
-- θ 坐标做 `cos(θ·K + φ)` —— 周期性编码良好
-- R 和 θ 通过**加法融合**: `R*kernel_1 + cos(θ)*kernel_2 + bias`
-  — 破坏了信息解耦, 无法选择性忽略某个坐标
+旧架构 `Coslayer_normalization`:
+- R 坐标只做 `R × kernel_1[i]` → **单标量线性投影**, 无法表达 R 方向的高频变化
+- θ 坐标做 `cos(θ·K + φ)` → 周期性好
+- R 和 θ 通过**加法融合**: `R*kernel_1 + cos(θ)*kernel_2 + bias` — 互相污染
 
-### 修改
+### 新架构
 
-新增 `new_neural_fourier_decoupled()` ([networks.py:806](tensordiffeq/networks.py#L806)):
+新增 `new_neural_fourier_decoupled()` ([networks.py:811](tensordiffeq/networks.py#L811)):
 
 ```
 输入 [R, θ]
-    │
-    ├── R → normalize to [-1,1]
-    │       → Fourier [sin(2ⁱπR), cos(2ⁱπR)] for i=0..L-1  (NeRF-style)
-    │       → MLP_R [2L → 32 → embed_dim]  → R_embed
-    │
-    └── θ → normalize to [-1,1]
-            → Fourier [sin(2ⁱπθ), cos(2ⁱπθ)] for i=0..L-1
-            → MLP_θ [2L → 32 → embed_dim]  → θ_embed
+    ├── R → normalize [-1,1] → [sin(2ⁱπR), cos(2ⁱπR)]₀³ → MLP(32,64) → R_embed (64d)
+    └── θ → normalize [-1,1] → [sin(2ⁱπθ), cos(2ⁱπθ)]₀³ → MLP(32,64) → θ_embed (64d)
 
-    Concat(R_embed, θ_embed)  →  [2×embed_dim]
-
-    Main Network (U/V branching):
-        x_U, x_V = Dense(width)(concat)
-        for each layer:
-            gate = tanh(Dense(x))
-            x = gate * x_U + (1-gate) * x_V
+    Concat → 128d → U/V branching → [NN_P, NN_γ]
 ```
 
-**新增 Config 参数**:
-- `num_fourier_freq = 4` (L=4, 每坐标 8 个 Fourier 特征)
-- `embed_dim = 64` (R/θ 独立编码到 64 维, concat 后 128 维进入主干)
-
-### 效果
-
-- R 方向获得高频表达能力 (Fourier 频率最高 2³π = 8π)
-- θ 方向保留周期性 (cos feature 天然周期)
-- concat 保持信息解耦, 网络可选择性关注某一坐标
-- 主干网络宽度保持 128 (与旧模型一致)
+- R 获得 4 频率 × 2 (sin+cos) = 8 个 Fourier 特征, 能表达高频变化
+- θ 同样 8 个 Fourier 特征, 天然周期性
+- concat 保持通道独立 — 网络可选择性忽略某个坐标
 
 ---
 
-## 2. 边界条件：MLP_g(R) + plateau σ(R)
+## 2. 边界条件：简洁硬约束
 
-### 问题
+### 核心公式
 
-旧硬约束:
-```
-P_final = tanh²( atanh(线性插值(√P_i, √P_o, R))     ← g_func_1: 1自由度(直线)
-                + x₁(R+1)((R-1)/(-2))² + x₂(R-1)((R+1)/2)² ← g_func_2: 2自由度(Hermite)
-                + σ(R)·NN_output )                              ← 边界处σ→0,NN被清零
-```
-- `g_func_1 + g_func_2` 总共只有 **3 个自由度**, 且被限制在 atanh-√ 空间
-- σ(R) 用指数型 `1-e^{p(-1-R)}`, 在边界附近衰减极快 → **"边界粘滞区"**
-- 真实解在 atanh-√ 空间不可能是直线+单峰 → 边界附近 g_func 错了, NN 也改不了
-
-### 修改: bc_switch=1 (改进硬 BC)
-
-**g_mlp(R)** ([networks.py:892-898](tensordiffeq/networks.py#L892-L898)):
-
-```
-g_mlp:  R_norm → Dense(8, tanh) → Dense(8, tanh) → Dense(1)  →  g_func
-参数数: (1×8+8)+(8×8+8)+(8×1+1) = 97 个可学习参数
+```python
+g(R) = atanh( 0.5·(1-R_norm)·√P_i  +  0.5·(1+R_norm)·√P_o )
+σ(R) = 1 − R_norm²
+P = tanh( g(R) + σ(R)·NN_P )²
 ```
 
-- 放弃 atanh-√ 直线先验, 让 MLP 从数据中学习 R→P_baseline 映射
-- 与主干网络共享反向传播, 不需单独训练
-
-**plateau σ(R)** ([networks.py:900-905](tensordiffeq/networks.py#L900-L905)):
+### 验证
 
 ```
-transition = 0.03  (归一到[-1,1]后, 占域宽 3%)
-
-t_left  = clip((R_norm+1)/transition,  0, 1)
-t_right = clip((1-R_norm)/transition,  0, 1)
-
-σ(R) = (3·t_left² - 2·t_left³) × (3·t_right² - 2·t_right³)
-       ───── Hermite cubic ────     ───── Hermite cubic ────
+在 R_norm = −1 (R_min):  σ=0, g=atanh(√P_i), P=tanh(atanh(√P_i))²=(√P_i)²=P_i  ✓
+在 R_norm = +1 (R_max):  σ=0, g=atanh(√P_o), P=tanh(atanh(√P_o))²=(√P_o)²=P_o  ✓
+在内部任意点:           σ≠0, NN 可自由修正 g(R) 的偏差
 ```
 
-σ(R) 的形状:
-```
- 1.0 ───────────────────────────┐         ┌─── 1.0
-                                 │         │
-                                /           \
-                               /             \
- 0.0 ─────────────────────────╱               ╲─────── 0.0
-     R=-1           R=-1+0.03              R=1-0.03    R=1
-```
+### 与旧对比
 
-- 中央 94% 区域 σ≡1 → NN 有充分自由修正 g_mlp
-- 只在距边界 3% 内衰减到 0 → 硬满足边界值
-- Hermite cubic = C¹ 光滑 → 导数连续, auto-diff 不出 NaN
+| 组件 | 旧 | 新 |
+|------|----|----|
+| g(R) | `atanh(线性(√P_i,√P_o))` + `x₁(R+1)((R-1)/(-2))²+x₂(R-1)((R+1)/2)²` | `atanh(线性(√P_i,√P_o))` |
+| 自由度 | 1+2=3 | 1 |
+| 训练参数 | x₁,x₂ (2个) | 0个 |
+| σ(R) | `p₃(1-e^{p₁(-1-R)})(1-e^{p₂(R-1)})` | `1−R²` |
+| 训练参数 | p₁,p₂,p₃ (3个) | 0个 |
 
-### 修改: bc_switch=2 (纯软约束)
-
-```
-P = tanh(NN_P_output)²
-γ = tanh(NN_γ_output)²
-```
-
-- 完全抛弃硬约束范式
-- 边界值由 BC 损失项 + PCGrad 自适应权重 + 高初始化权重 保证
-- 适用场景: 当域边界不规则或边界条件复杂时
+**为什么好**: g(R) 和 σ(R) 是纯数学的 — atanh 是 tanh² 的反函数预补偿, 1−R² 是最简单的边界归零函数。内部偏差全部交给 NN, 不在 BC 机制上浪费参数。
 
 ---
 
-## 3. 膜厚梯度：ABC 组合控梯策略
+## 3. PDE 残差与训练：不变
 
-### 问题
+- PDE 残差公式完全不变: Poiseuille + 楔形 + τ稳定化
+- 训练流程完全不变: 4阶段分段LR + PCGrad + RAD重采样
+- 损失函数不变: `L_total = w₁·L_Reynolds + w₂·L_FB + w₃·L_BC`
 
-PDE 残差中 `∂H/∂θ` 以裸量出现 (前乘 Λ≈50):
-
-```
-part_3_1 = -Λ·∂H/∂θ          ← 在槽边界处 ≈ 1800
-part_1,2 = Poiseuille 扩散项  ← ≈ 1~10
-
-→ 全局梯度由楔形项绝对主导 (差3个数量级)
-→ 优化器不计代价地"抹平" H 的梯度 → 忽略空化/扩散
-```
-
-### 修改
-
-三招组合 ([reynold_pinn.py:175-239](reynold_pinn.py#L175-L239)):
-
-**A. `stop_gradient(H)` 截断楔形梯度** (L200-201):
-```python
-H_for_wedge = tf.stop_gradient(H)  # H数值正确, 但梯度不反传
-part_3_1 = -Λ · ∂(H_for_wedge)/∂θ  # 对网络的 ∂L/∂w 中此项=0
-```
-- 楔形项仍然驱动 PDE 残差 (物理正确)
-- 但不再劫持网络权重的更新方向
-
-**B. `w_wedge` 课程权重** (L189-190, 310-320):
-```python
-w_wedge:  阶段1=0.01 → 阶段2=0.34 → 阶段3=0.67 → 阶段4=1.0
-part_3_1 *= w_wedge
-```
-- 前20000步: 几乎是纯 Poiseuille 扩散 (学光滑压力场)
-- 20000-40000步: 逐步引入楔形效应
-- 60000-80000步: 完整 PDE
-
-**C. 逐点权重压制槽边界** (L222-231):
-```python
-grad_H_theta = ∂H/∂θ                         # 原始 H 的梯度
-mean_grad = mean(|∂H/∂θ|)                     # ∼整个域的均值
-point_weight = 1 / (1 + |∂H/∂θ| / mean_grad) # 槽边界≈0.001, 其他≈1
-f_p = point_weight * f_p_raw
-```
-- 槽边界点 (|∂H/∂θ| ≫ mean) →权重→0, loss 贡献被压制
-- 平滑区域点 →权重≈1, loss 贡献不受影响
-- 使用 `stop_gradient(weight)` 避免引入二阶梯度
+**核心信念**: Fourier 输入 + 简洁硬 BC 已经足够好, 不需要额外的梯度操纵或课程学习。
 
 ---
 
 ## 修改的文件
 
 ### `tensordiffeq/networks.py`
-
-- **新增**: `new_neural_fourier_decoupled()` (L806-930) — Fourier 解耦架构
-  - 输入: (N,2), 输出: [P(N,1), γ(N,1)]
-  - 包含独立 R-MLP + θ-MLP + 主干 U/V 网络
-  - `bc_switch=1`: MLP_g(R) + plateau σ(R) + tanh²
-  - `bc_switch=2`: 纯 tanh² (无硬约束)
+- 新增 `new_neural_fourier_decoupled()` — 约 115 行
+- 旧函数全部保留不动
 
 ### `tensordiffeq/models.py`
-
-- **修改**: `compile()` 签名新增 `bc_switch`, `num_freq`, `embed_dim` (L24)
-- **新增**: `u_model_switch=13` 分支 (L103-114)
-  - 存储 `self.bc_switch`, `self.num_freq`, `self.embed_dim`
-  - 调用 `new_neural_fourier_decoupled()`
+- `compile()` 新增 `num_freq=4, embed_dim=64` 参数
+- 新增 `u_model_switch=13` 分支
 
 ### `reynold_pinn.py`
-
-- **Config 类**: 新增 10 个参数 (L67-86)
-  - `u_model_switch=13`, `bc_switch=1`
-  - `num_fourier_freq=4`, `embed_dim=64`
-  - `h_step_type='hermite'`
-  - `w_wedge_init/final`, `use_stop_gradient_H`, `use_point_weight`
-
-- **`create_H_func()`** (L138-199): 新增三种过渡类型
-  - `_step_fn(x)`: 根据 `h_step_type` 选择 hermite/relu/sigmoid
-  - Hermite: `clip(x,0,1)` → `3t²-2t³`
-  - RELU: `clip(x,0,1)` (C⁰)
-
-- **`create_pde_models()`** (L201-248): 返回 3 元组
-  - 新增 `w_wedge_var` (trainable=False)
-  - 方法A: `stop_gradient(H)` 用于楔形项
-  - 方法B: `w_wedge_var` 缩放楔形项
-  - 方法C: `point_weight` 逐点降权
-  - 返回 `set_w_wedge(new_val)` 调度函数
-
-- **`train_model()`** (L307-350): 新增 w_wedge 课程
-  - 4 阶段线性插值: `[0.01, 0.34, 0.67, 1.0]`
-  - 每阶段开始时打印 `w_wedge` 值
-
-- **`main()`** (L497-563):
-  - 使用 `cfg.u_model_switch` (不再硬编码 8)
-  - 传递 `bc_switch`, `num_freq`, `embed_dim` 到 `compile()`
-  - 挂载 `model.set_w_wedge` 供 train_model 使用
-
-### `doc/update.md` (新建)
-
-- 本文件
+- Config: 新增 `u_model_switch=13`, `num_fourier_freq=4`, `embed_dim=64`
+- `create_H_func`: 去掉了 step_type 开关, 固定使用 Hermite 三次过渡
+- `create_pde_models`: 回归标准版, 去掉了 w_wedge/stop_gradient/point_weight
+- `train_model`: 回归朴素版, 去掉 w_wedge 课程
+- `main`: 简化调用链, `u_model_switch`/`num_freq`/`embed_dim` 从 Config 读取
+- `layer_sizes`: `[2, 128, 128, 128, 128, 128, 2]` (6层)
 
 ---
 
-## 运行方式
+## 使用
 
 ```bash
-# 使用新架构 (默认 bc_switch=1, h_step_type='hermite')
 python reynold_pinn.py
-
-# 若要回退旧行为, 修改 Config 中的:
-#   u_model_switch = 8     (旧极坐标硬BC)
-#   h_step_type = 'sigmoid' (旧膜厚)
 ```
 
-**注意**: 对比脚本 `compare_fem_pinn_final.py` 中硬编码了 `u_model_switch=8`。使用新模型训练后, 需将其中 `u_model_switch=8` 改为 `13`, 并添加相应参数, 否则加载权重会因架构不匹配而失败。
+默认使用新架构 (`u_model_switch=13`)。回退旧架构: 在 Config 中设 `u_model_switch=8`。
 
----
-
-## 向后兼容
-
-- 所有原 switch (1-12) 和原有函数**不受影响**
-- `create_H_func` 的 `cfg` 参数可传入旧 Config (无 `h_step_type` 属性时会 fallback 到 `'sigmoid'`)
-- `create_pde_models` 的 `cfg=None` 默认关闭 ABC 策略 (旧行为)
-- `compile()` 的新参数均有默认值, 旧代码不传也能运行
+**注意**: 对比脚本 `compare_fem_pinn_final.py` 中硬编码了 `u_model_switch=8`。切换架构后需同步修改。

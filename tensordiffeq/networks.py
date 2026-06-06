@@ -271,7 +271,8 @@ def new_neural_period_polar_exactBC_two_output_one(layer_sizes,bc_values,r_lim,t
 
     inputs_new = tf.concat([inputs_R, inputs_Theta], 1)'''
 
-    x,inputs_R = Coslayer_normalization(layer_sizes[1],r_lim,theta_lim, activation=tf.nn.tanh, kernel_initializer="glorot_normal", bias_initializer="glorot_normal")(inputs)
+    x = Coslayer_normalization(layer_sizes[1],r_lim,theta_lim, activation=tf.nn.tanh, kernel_initializer="glorot_normal", bias_initializer="glorot_normal")(inputs)
+    inputs_R = 2.0 * (inputs[:, 0:1] - r_lim[0]) / (r_lim[1] - r_lim[0]) - 1.0
     #x = layers.Dense(layer_sizes[2], activation=tf.nn.tanh, kernel_initializer="glorot_normal")(x)
     x_U = layers.Dense(layer_sizes[1], activation=tf.nn.tanh, kernel_initializer="glorot_normal")(x)
     x_V = layers.Dense(layer_sizes[1], activation=tf.nn.tanh, kernel_initializer="glorot_normal")(x)
@@ -307,7 +308,8 @@ def new_neural_period_polar_exactBC_two_output_three(layer_sizes,bc_values,r_lim
     inputs = tf.keras.Input(shape=(2,))  # Returns a placeholder tensor
 
 
-    x,inputs_R = Coslayer_normalization(layer_sizes[1],r_lim,theta_lim, activation=tf.nn.tanh, kernel_initializer="glorot_normal", bias_initializer="glorot_normal")(inputs)
+    x = Coslayer_normalization(layer_sizes[1],r_lim,theta_lim, activation=tf.nn.tanh, kernel_initializer="glorot_normal", bias_initializer="glorot_normal")(inputs)
+    inputs_R = 2.0 * (inputs[:, 0:1] - r_lim[0]) / (r_lim[1] - r_lim[0]) - 1.0
     #x = layers.Dense(layer_sizes[2], activation=tf.nn.tanh, kernel_initializer="glorot_normal")(x)
     x_U = layers.Dense(layer_sizes[1], activation=tf.nn.tanh, kernel_initializer="glorot_normal")(x)
     x_V = layers.Dense(layer_sizes[1], activation=tf.nn.tanh, kernel_initializer="glorot_normal")(x)
@@ -345,8 +347,9 @@ def new_neural_period_polar_exactBC_two_output_three(layer_sizes,bc_values,r_lim
 def new_neural_period_polar_exactBC(layer_sizes, bc_values, r_lim, theta_lim):
     inputs = tf.keras.Input(shape=(2,))  # Returns a placeholder tensor
 
-    x, inputs_R = Coslayer_normalization(layer_sizes[1], r_lim, theta_lim, activation=tf.nn.tanh,
+    x = Coslayer_normalization(layer_sizes[1], r_lim, theta_lim, activation=tf.nn.tanh,
                                          kernel_initializer="glorot_normal", bias_initializer="glorot_normal")(inputs)
+    inputs_R = 2.0 * (inputs[:, 0:1] - r_lim[0]) / (r_lim[1] - r_lim[0]) - 1.0
     # x = layers.Dense(layer_sizes[2], activation=tf.nn.tanh, kernel_initializer="glorot_normal")(x)
     x_U = layers.Dense(layer_sizes[2], activation=tf.nn.tanh, kernel_initializer="glorot_normal")(x)
     x_V = layers.Dense(layer_sizes[2], activation=tf.nn.tanh, kernel_initializer="glorot_normal")(x)
@@ -400,7 +403,8 @@ def new_neural_period_polar_exactBC_two_output(layer_sizes,bc_values,r_lim,theta
 
     inputs_new = tf.concat([inputs_R, inputs_Theta], 1)'''
 
-    x,inputs_R = Coslayer_normalization(layer_sizes[1],r_lim,theta_lim, activation=tf.nn.tanh, kernel_initializer="glorot_normal", bias_initializer=tf.constant_initializer(0))(inputs)
+    x = Coslayer_normalization(layer_sizes[1],r_lim,theta_lim, activation=tf.nn.tanh, kernel_initializer="glorot_normal", bias_initializer=tf.constant_initializer(0))(inputs)
+    inputs_R = 2.0 * (inputs[:, 0:1] - r_lim[0]) / (r_lim[1] - r_lim[0]) - 1.0
     #x = layers.Dense(layer_sizes[2], activation=tf.nn.tanh, kernel_initializer="glorot_normal")(x)
     x_U = layers.Dense(layer_sizes[2], activation=tf.nn.tanh, kernel_initializer="glorot_normal")(x)
     x_V = layers.Dense(layer_sizes[2], activation=tf.nn.tanh, kernel_initializer="glorot_normal")(x)
@@ -492,8 +496,9 @@ def new_neural_period_polar_exactBC_two_output_is_texture_func(layer_sizes, bc_v
     inputs = tf.keras.Input(shape=(2,))  # Returns a placeholder tensor
 
 
-    x, inputs_R = Coslayer_normalization(layer_sizes[1], r_lim, theta_lim, activation=tf.nn.tanh,
+    x = Coslayer_normalization(layer_sizes[1], r_lim, theta_lim, activation=tf.nn.tanh,
                                          kernel_initializer="glorot_normal", bias_initializer="glorot_normal")(inputs)
+    inputs_R = 2.0 * (inputs[:, 0:1] - r_lim[0]) / (r_lim[1] - r_lim[0]) - 1.0
     # x = layers.Dense(layer_sizes[2], activation=tf.nn.tanh, kernel_initializer="glorot_normal")(x)
     x_U = layers.Dense(layer_sizes[2], activation=tf.nn.tanh, kernel_initializer="glorot_normal")(x)
     x_V = layers.Dense(layer_sizes[2], activation=tf.nn.tanh, kernel_initializer="glorot_normal")(x)
@@ -789,7 +794,7 @@ class Coslayer_normalization(layers.Layer):
 
         if self.activation is not None:
             outputs = self.activation(outputs)
-        return outputs,inputs_R
+        return outputs
 
     def compute_output_shape(self, input_shape):
         input_shape = tensor_shape.TensorShape(input_shape)
@@ -804,12 +809,27 @@ class Coslayer_normalization(layers.Layer):
 # Fourier Feature Decoupled Architecture (u_model_switch=13)
 # =============================================================================
 def new_neural_fourier_decoupled(layer_sizes, bc_values, r_lim, theta_lim,
-                                  bc_switch=1, num_freq=4, embed_dim=64):
+                                  num_freq=4, embed_dim=64):
     """
-    Decoupled Fourier feature encoding with separate MLPs for R and θ.
-    Keras 3 compatible: all TensorFlow ops on symbolic tensors are wrapped
-    inside Keras layers/Lambda.
+    Decoupled Fourier feature encoding with separate MLPs for R and θ,
+    plus simple hard Dirichlet BC enforcement.
+
+    Input:
+        [R, θ]  — dimensionless polar coordinates
+    Architecture:
+        R  → normalize → Fourier(sin/cos) → MLP_R(32,embed_dim) → R_embed
+        θ  → normalize → Fourier(sin/cos) → MLP_θ(32,embed_dim) → θ_embed
+        Concat(R_embed, θ_embed) → U/V branching → [NN_P, NN_γ]
+
+    Hard BC (for P only):
+        g(R) = atanh( linear_interp(√P_i, √P_o) )    ← pre-inversion for tanh²
+        σ(R) = 1 − R_norm²                             ← 0 at boundaries, >0 inside
+        P = tanh( g(R) + σ(R)·NN_P )²                  ← exact at R_min, R_max
+        γ = tanh( NN_γ )²                              ← non-negative, no BC needed
     """
+    sqrt_P_i = float(np.sqrt(bc_values[0]))
+    sqrt_P_o = float(np.sqrt(bc_values[1]))
+
     inputs = tf.keras.Input(shape=(2,))
 
     # ── Coordinate extraction ──────────────────────────────────────────
@@ -876,36 +896,23 @@ def new_neural_fourier_decoupled(layer_sizes, bc_values, r_lim, theta_lim,
                             bias_initializer=tf.constant_initializer(0),
                             kernel_initializer="glorot_normal")(x)
 
-    # ── Boundary condition handling ───────────────────────────────────
-    if bc_switch == 1:
-        g_h = layers.Dense(8, activation='tanh', kernel_initializer="glorot_normal")(R_norm)
-        g_h = layers.Dense(8, activation='tanh', kernel_initializer="glorot_normal")(g_h)
-        g_func = layers.Dense(1, activation=None, kernel_initializer="glorot_normal")(g_h)
+    # ── Simple Hard BC: P = tanh( g(R) + σ(R)·NN_P )² ────────────────
+    # g(R) = atanh( linear interpolation of √P in [R_min, R_max] )
+    # P_i, P_o are bc_values[0], bc_values[1]; √ version pre-compensates tanh²
+    g_func = layers.Lambda(
+        lambda x, si=sqrt_P_i, so=sqrt_P_o: tf.math.atanh(
+            0.5 * (1.0 - x) * si + 0.5 * (1.0 + x) * so
+        ), name="g_func"
+    )(R_norm)
 
-        transition = 0.03
-        t_left = layers.Lambda(
-            lambda x: tf.clip_by_value((x + 1.0) / transition, 0.0, 1.0),
-            name="clip_left"
-        )(R_norm)
-        t_right = layers.Lambda(
-            lambda x: tf.clip_by_value((1.0 - x) / transition, 0.0, 1.0),
-            name="clip_right"
-        )(R_norm)
-        sigma_func = layers.Lambda(
-            lambda xs: (3.0 * xs[0] ** 2 - 2.0 * xs[0] ** 3) *
-                       (3.0 * xs[1] ** 2 - 2.0 * xs[1] ** 3),
-            name="sigma_func"
-        )([t_left, t_right])
+    # σ(R) = 1 − R_norm²   (quadratic: 0 at ±1, 1 at R=0)
+    sigma_func = layers.Lambda(
+        lambda x: 1.0 - tf.square(x), name="sigma_func"
+    )(R_norm)
 
-        sigma_nn = layers.Multiply()([sigma_func, nn_P])
-        P_raw = layers.Add()([g_func, sigma_nn])
-        gamma_raw = nn_gamma
-
-    elif bc_switch == 2:
-        P_raw = nn_P
-        gamma_raw = nn_gamma
-    else:
-        raise ValueError(f"bc_switch must be 1 or 2, got {bc_switch}")
+    sigma_nn = layers.Multiply(name="sigma_times_nn")([sigma_func, nn_P])
+    P_raw = layers.Add(name="P_raw")([g_func, sigma_nn])
+    gamma_raw = nn_gamma
 
     P = layers.Lambda(lambda x: tf.square(tf.tanh(x)), name="P_output")(P_raw)
     gamma = layers.Lambda(lambda x: tf.square(tf.tanh(x)), name="gamma_output")(gamma_raw)
