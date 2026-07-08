@@ -3,7 +3,7 @@ import os
 import numpy as np
 import torch
 
-from .networks import FourierDecoupledPINN
+from .networks import FourierDecoupledPINN, SimpleMLPPINN
 from .pcgrad import pcgrad
 from .utils import mse, to_torch
 
@@ -11,8 +11,10 @@ from .utils import mse, to_torch
 class TorchCollocationSolver:
     """PyTorch PINN solver, replacing CollocationSolverND from tensordiffeq.
 
-    Designed for the Reynolds equation with JFO cavitation model using
-    FourierDecoupledPINN architecture.
+    Designed for the Reynolds equation with JFO cavitation model.
+    Supports two architectures:
+      - switch=8:  SimpleMLPPINN  (vanilla MLP, soft BC)
+      - switch=13: FourierDecoupledPINN (Fourier encoding, hard BC)
     """
 
     def __init__(self, device=None, verbose=True):
@@ -31,7 +33,8 @@ class TorchCollocationSolver:
                 isAdaptive=False, MTL_adapt=False, PCGrad_true=True,
                 Boundary_true=False,
                 R_range=None, theta_range=None,
-                bc_switch=1, num_freq=4, embed_dim=64):
+                bc_switch=1, num_freq=4, embed_dim=64,
+                batch_size=None):
         """Compile the solver with model architecture and PDE configuration.
 
         Args:
@@ -47,11 +50,14 @@ class TorchCollocationSolver:
             bc_switch: BC handling mode (1=hard BC with g_net, 2=soft BC).
             num_freq: Number of Fourier feature frequencies.
             embed_dim: Embedding dimension for R/theta encoders.
+            batch_size: Mini-batch size for collocation points.
+                        None or 0 = full-batch (all points per step).
+                        Recommended: 2048~8192 for ~10000 total points.
         """
-        if u_model_switch != 13:
+        if u_model_switch not in (8, 13):
             raise NotImplementedError(
                 f"u_model_switch={u_model_switch} is not supported in torch_pinn. "
-                f"Only switch=13 (FourierDecoupledPINN) is implemented."
+                f"Use switch=8 (SimpleMLPPINN) or switch=13 (FourierDecoupledPINN)."
             )
 
         self.layer_sizes = layer_sizes
@@ -67,21 +73,32 @@ class TorchCollocationSolver:
         self.bc_switch = bc_switch
         self.num_freq = num_freq
         self.embed_dim = embed_dim
+        self.batch_size = batch_size if (batch_size and batch_size > 0) else None
+        self.u_model_switch = u_model_switch
 
         # Extract domain points
         self.domain_X_f = np.asarray(self.domain.X_f, dtype=np.float32)
         self.N_f_true = len(self.domain_X_f)
 
         # Build the neural network
-        self.u_model = FourierDecoupledPINN(
-            layer_sizes,
-            self._extract_bc_values(),
-            R_range,
-            theta_range,
-            bc_switch=bc_switch,
-            num_freq=num_freq,
-            embed_dim=embed_dim,
-        ).to(self.device)
+        if u_model_switch == 8:
+            self.u_model = SimpleMLPPINN(
+                layer_sizes,
+                self._extract_bc_values(),
+                R_range,
+                theta_range,
+                bc_switch=bc_switch,
+            ).to(self.device)
+        else:  # switch == 13
+            self.u_model = FourierDecoupledPINN(
+                layer_sizes,
+                self._extract_bc_values(),
+                R_range,
+                theta_range,
+                bc_switch=bc_switch,
+                num_freq=num_freq,
+                embed_dim=embed_dim,
+            ).to(self.device)
 
         self.optimizer = torch.optim.Adam(
             self.u_model.parameters(), lr=1e-3, betas=(0.99, 0.999)
@@ -114,9 +131,22 @@ class TorchCollocationSolver:
         for group in self.optimizer.param_groups:
             group["lr"] = lr
 
-    def _domain_tensors(self, requires_grad=True):
-        """Create tensors for domain collocation points with gradient tracking."""
+    def _domain_tensors(self, requires_grad=True, batch_size=None):
+        """Create tensors for domain collocation points with gradient tracking.
+
+        Args:
+            requires_grad: If True, the returned tensors track gradients
+                           (needed for PDE residuals that use autograd).
+            batch_size: If set, randomly sample this many points from the
+                        full collocation set. None = use all points.
+
+        Returns:
+            (r, theta): Tensors of shape (N, 1) each.
+        """
         x = to_torch(self.domain_X_f, self.device)
+        if batch_size is not None and batch_size < len(x):
+            indices = torch.randperm(len(x), device=self.device)[:batch_size]
+            x = x[indices]
         r = x[:, 0:1].clone().detach().requires_grad_(requires_grad)
         theta = x[:, 1:2].clone().detach().requires_grad_(requires_grad)
         return r, theta
@@ -124,13 +154,17 @@ class TorchCollocationSolver:
     def compute_losses(self):
         """Compute all loss terms: residuals + boundary conditions.
 
+        Collocation-point losses (Reynolds residual, JFO interaction) are
+        computed on a random mini-batch when self.batch_size is set.
+        Boundary condition losses always use the full BC point set.
+
         Returns:
             List of loss tensors, one per term.
         """
-        r, theta = self._domain_tensors(requires_grad=True)
+        r, theta = self._domain_tensors(requires_grad=True, batch_size=self.batch_size)
         losses = []
 
-        # Residual losses from f_model_list
+        # Residual losses from f_model_list (batched)
         for f_model in self.f_model_list:
             residuals = f_model(self.u_model, r, theta)
             if not isinstance(residuals, (list, tuple)):
@@ -138,7 +172,7 @@ class TorchCollocationSolver:
             for res in residuals:
                 losses.append(mse(res, torch.zeros_like(res)))
 
-        # Boundary condition losses
+        # Boundary condition losses (always full set — tiny)
         if self.Boundary_true:
             for bc in self.bcs:
                 if hasattr(bc, 'isDirichlect') and bc.isDirichlect:
@@ -151,10 +185,10 @@ class TorchCollocationSolver:
                     target = to_torch(bc.val, self.device)
                     losses.append(mse(p_pred.reshape(-1, 1), target.reshape(-1, 1)))
 
-        # JFO interaction term (complementarity condition)
+        # JFO interaction term (batched — reuse same batch as residuals)
         if self.two_output:
-            x = to_torch(self.domain_X_f, self.device)
-            p, gamma = self.u_model(x)
+            x_batch = torch.cat([r.detach(), theta.detach()], dim=1)
+            p, gamma = self.u_model(x_batch)
             p = p.reshape(-1, 1)
             gamma = gamma.reshape(-1, 1)
             # Fischer-Burmeister: P + gamma - sqrt(P^2 + gamma^2) = 0
@@ -365,13 +399,15 @@ class TorchCollocationSolver:
         payload = {
             'state_dict': self.u_model.state_dict(),
             'layer_sizes': self.layer_sizes,
-            'bc_values': self._extract_bc_values(),
             'R_range': self.R_range,
             'theta_range': self.theta_range,
             'bc_switch': self.bc_switch,
             'num_freq': self.num_freq,
             'embed_dim': self.embed_dim,
+            'u_model_switch': self.u_model_switch,
         }
+        if self.u_model_switch == 13:
+            payload['bc_values'] = self._extract_bc_values()
         torch.save(payload, os.path.join(model_path, "model.pt"))
 
     def load_model(self, model_path):
@@ -381,22 +417,31 @@ class TorchCollocationSolver:
             map_location=self.device
         )
         self.layer_sizes = payload['layer_sizes']
-        bc_values = payload['bc_values']
         self.R_range = payload['R_range']
         self.theta_range = payload['theta_range']
         self.bc_switch = payload.get('bc_switch', 1)
         self.num_freq = payload.get('num_freq', 4)
         self.embed_dim = payload.get('embed_dim', 64)
+        self.u_model_switch = payload.get('u_model_switch', 13)
 
-        self.u_model = FourierDecoupledPINN(
-            self.layer_sizes,
-            bc_values,
-            self.R_range,
-            self.theta_range,
-            bc_switch=self.bc_switch,
-            num_freq=self.num_freq,
-            embed_dim=self.embed_dim,
-        ).to(self.device)
+        if self.u_model_switch == 8:
+            bc_values = payload.get('bc_values', [0.0, 0.0])
+            self.u_model = SimpleMLPPINN(
+                self.layer_sizes, bc_values,
+                self.R_range, self.theta_range,
+                bc_switch=self.bc_switch,
+            ).to(self.device)
+        else:
+            bc_values = payload.get('bc_values', [0.0, 0.0])
+            self.u_model = FourierDecoupledPINN(
+                self.layer_sizes,
+                bc_values,
+                self.R_range,
+                self.theta_range,
+                bc_switch=self.bc_switch,
+                num_freq=self.num_freq,
+                embed_dim=self.embed_dim,
+            ).to(self.device)
         self.u_model.load_state_dict(payload['state_dict'])
         self.u_model.eval()
         return self

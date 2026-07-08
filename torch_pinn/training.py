@@ -12,7 +12,9 @@ from .utils import piecewise_lr
 
 
 def train_model_torch(model, cfg, N_f_true):
-    """Multi-stage training with curriculum learning and adaptive refinement.
+    """Multi-stage training with LR schedules and adaptive refinement.
+
+    Simplified version: no w_wedge curriculum, plain LR decay.
 
     Args:
         model: TorchCollocationSolver instance.
@@ -31,27 +33,7 @@ def train_model_torch(model, cfg, N_f_true):
         {'boundaries': [20000, 40000], 'values': [1e-5, 1e-5, 1e-6]},
     ]
 
-    # w_wedge curriculum: ramp from ~0.01 (pure diffusion) to 1.0 (full wedge)
-    w_wedge_init = getattr(cfg, 'w_wedge_init', 1e-2)
-    w_wedge_final = getattr(cfg, 'w_wedge_final', 1.0)
-    n_stages = len(lr_schedules)
-    w_wedge_values = [
-        w_wedge_init + (w_wedge_final - w_wedge_init) * i / (n_stages - 1)
-        for i in range(n_stages)
-    ]
-
-    if hasattr(model, 'set_w_wedge') and model.set_w_wedge is not None:
-        has_wedge = True
-    else:
-        has_wedge = False
-
     for stage_idx, schedule in enumerate(lr_schedules):
-        # Update wedge curriculum weight
-        if has_wedge:
-            w_val = w_wedge_values[stage_idx]
-            model.set_w_wedge(w_val)
-            print(f"[Stage {stage_idx + 1}/{n_stages}] w_wedge = {w_val:.3e}")
-
         N_train = getattr(cfg, 'N_train', 5000)
         NL_train = getattr(cfg, 'NL_train', 4)
 
@@ -69,21 +51,20 @@ def train_model_torch(model, cfg, N_f_true):
                     if len(model.epoch_history) == 0 or model.epoch_history[-1] != global_epoch:
                         model.epoch_history.append(global_epoch + 1)
                     else:
-                        # Update in place
                         model.epoch_history[-1] = global_epoch + 1
                     model.loss_all_history.append(
                         [float(v.cpu().item()) for v in loss_all]
                     )
 
                 if epoch % 500 == 0:
-                    loss_names = ['L_Reynolds', 'L_FB']
+                    loss_names = ['L_Reynolds', 'L_FB', 'L_BC', 'L_Interact']
                     parts = []
                     for i, name in enumerate(loss_names):
                         if i < len(loss_all):
                             parts.append(f'{name}={loss_all[i].cpu().item():.3e}')
                     loss_str = ' | '.join(parts)
                     print(
-                        f'  Epoch {global_epoch} (outer {outer_idx + 1}/{NL_train}): '
+                        f'  Epoch {global_epoch} (stage {stage_idx + 1}, outer {outer_idx + 1}/{NL_train}): '
                         f'Total={loss_value.cpu().item():.3e} | {loss_str}'
                     )
 

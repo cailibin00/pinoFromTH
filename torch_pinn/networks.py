@@ -116,3 +116,77 @@ class FourierDecoupledPINN(nn.Module):
         p = torch.tanh(p_raw) ** 2
         gamma = torch.tanh(gamma_raw) ** 2
         return p, gamma
+
+
+class SimpleMLPPINN(nn.Module):
+    """Vanilla MLP PINN — no Fourier encoding, no decoupled branches.
+
+    Input:  [R_norm, theta_norm]  (both normalized to [-1, 1])
+    Output: [P, gamma]            (both ∈ [0, 1] via tanh²)
+
+    Supports two BC modes:
+      bc_switch=1: hard BC — g_net(R) + sigma(R) * nn_p  (original approach)
+      bc_switch=2: soft BC — direct output (BC via loss penalty)
+    """
+
+    def __init__(self, layer_sizes, bc_values, r_lim, theta_lim, bc_switch=1):
+        super().__init__()
+        self.r_lim = r_lim
+        self.theta_lim = theta_lim
+        self.bc_switch = bc_switch
+        self.bc_values = bc_values  # [P_i, P_o]
+
+        layers = []
+        for i in range(len(layer_sizes) - 1):
+            layers.append(nn.Linear(layer_sizes[i], layer_sizes[i + 1]))
+            if i < len(layer_sizes) - 2:
+                layers.append(nn.Tanh())
+        self.net = nn.Sequential(*layers)
+
+        # Hard BC: small trainable network for boundary pressure profile
+        if bc_switch == 1:
+            self.g_net = nn.Sequential(
+                nn.Linear(1, 8),
+                nn.Tanh(),
+                nn.Linear(8, 8),
+                nn.Tanh(),
+                nn.Linear(8, 1),
+            )
+        self._init_weights()
+
+    def _init_weights(self):
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_normal_(module.weight)
+                nn.init.zeros_(module.bias)
+
+    def _normalize(self, x, lim):
+        return 2.0 * (x - lim[0]) / (lim[1] - lim[0]) - 1.0
+
+    def forward(self, inputs):
+        r = inputs[:, 0:1]
+        theta = inputs[:, 1:2]
+        r_norm = self._normalize(r, self.r_lim)
+        theta_norm = self._normalize(theta, self.theta_lim)
+        x = torch.cat([r_norm, theta_norm], dim=1)
+        out = self.net(x)
+        nn_p = out[:, 0:1]
+        nn_gamma = out[:, 1:2]
+
+        if self.bc_switch == 1:
+            g_func = self.g_net(r_norm)
+            transition = 0.03
+            t_left = torch.clamp((r_norm + 1.0) / transition, 0.0, 1.0)
+            t_right = torch.clamp((1.0 - r_norm) / transition, 0.0, 1.0)
+            sigma = (3.0 * t_left ** 2 - 2.0 * t_left ** 3) * (3.0 * t_right ** 2 - 2.0 * t_right ** 3)
+            p_raw = g_func + sigma * nn_p
+            gamma_raw = nn_gamma
+        elif self.bc_switch == 2:
+            p_raw = nn_p
+            gamma_raw = nn_gamma
+        else:
+            raise ValueError(f"bc_switch must be 1 or 2, got {self.bc_switch}")
+
+        p = torch.tanh(p_raw) ** 2
+        gamma = torch.tanh(gamma_raw) ** 2
+        return p, gamma

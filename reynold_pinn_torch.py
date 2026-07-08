@@ -59,31 +59,26 @@ class Config:
     omega_rpm = 6000       # 转速 (rpm)
 
     # 数值参数
-    N_f = 4900             # 配点数
-    N_groove_b = 50        # 槽边界采样点数
-    N_groove_r = 20        # 槽径向边界采样点数
-    domain_fidelity = 50   # 域网格密度
+    N_f = 10000            # 配点数 (100×100网格, 提升空化边界分辨率)
+    N_groove_b = 80        # 槽边界采样点数 (沿螺旋边界加密)
+    N_groove_r = 32        # 槽径向边界采样点数 (槽起点径向线加密)
+    domain_fidelity = 80   # 域网格密度 (BC边界网格分辨率)
 
     # 训练参数
     layer_sizes = [2, 128, 128, 128, 128, 128, 2]
-    N_train = 5000         # 每阶段训练迭代数
-    NL_train = 4           # RAD细化轮数
-    ratio_RAD_list = [0.03, 0.01]  # RAD采样比例
+    N_train = 4000         # 每阶段训练迭代数 (配合更多配点的适度调整)
+    NL_train = 5           # RAD细化轮数 (更多轮次渐进优化边界)
+    ratio_RAD_list = [0.05, 0.02]  # RAD采样比例 (每轮在高残差区增加5%+2%配点)
+    batch_size = 4096      # Mini-batch大小 (None或0=全批量; 推荐2048~8192)
 
     # ── 模型架构开关 ──
-    u_model_switch = 13    # 13=Fourier解耦架构
-    bc_switch = 1          # 1=改进硬BC(MLP_g+plateau σ), 2=纯软约束
-    num_fourier_freq = 4   # Fourier特征频率数
-    embed_dim = 64         # R/θ MLP编码输出维度
+    u_model_switch = 8     # 8=SimpleMLPPINN (vanilla MLP), 13=FourierDecoupledPINN
+    bc_switch = 1          # 1=硬约束BC (g_net+hermite σ, 原始方案), 2=纯软约束
+    num_fourier_freq = 4   # (仅switch=13使用) Fourier特征频率数
+    embed_dim = 64         # (仅switch=13使用) R/θ MLP编码输出维度
 
     # ── 膜厚过渡类型 ──
-    h_step_type = 'hermite'  # 'sigmoid' | 'hermite' | 'relu'
-
-    # ── 楔形项课程学习 ──
-    w_wedge_init = 1e-2
-    w_wedge_final = 1.0
-    use_stop_gradient_H = True
-    use_point_weight = True
+    h_step_type = 'sigmoid'  # 'sigmoid' | 'hermite' | 'relu'
 
     # 绘图参数
     dpi_save = 600
@@ -135,12 +130,10 @@ def compute_physical_params(cfg: Config):
 # 3. 膜厚函数
 # =============================================================================
 def create_H_func(params, cfg: Config):
-    """创建膜厚函数 H(R, theta) (PyTorch版)
+    """创建膜厚函数 H(R, theta) — 简单sigmoid过渡, 固定ξ
 
-    支持三种过渡类型 (cfg.h_step_type):
-        'hermite' — C¹分段三次多项式
-        'sigmoid' — C∞光滑
-        'relu'    — C⁰锐利裁剪
+    不使用hermite过渡, 不使用可训练ξ, 不使用ABC控梯策略。
+    回归最简单的sigmoid平滑膜厚。
     """
     R_d_1 = params['R_d_1']
     R_d_2 = params['R_d_2']
@@ -151,41 +144,28 @@ def create_H_func(params, cfg: Config):
     groove_ratio = params['groove_ratio']
     K_val = float(params['K'].item())
 
-    # 平滑参数
-    N_xi = 50.0
-    R_xi = 100.0
-    xi_R = (params['R_lim'][1] - params['R_lim'][0]) / R_xi
-    xi_theta = (params['theta_lim'][1] - params['theta_lim'][0]) / N_xi
+    # 固定过渡宽度
+    xi_R = (params['R_lim'][1] - params['R_lim'][0]) / 100.0
+    xi_theta = (params['theta_lim'][1] - params['theta_lim'][0]) / 50.0
     theta_offset = np.pi / 6
-
-    step_type = getattr(cfg, 'h_step_type', 'sigmoid')
-
-    def _step_fn(x):
-        """过渡函数"""
-        if step_type == 'hermite':
-            t = torch.clamp(x, 0.0, 1.0)
-            return 3 * t**2 - 2 * t**3
-        elif step_type == 'relu':
-            return torch.clamp(x, 0.0, 1.0)
-        else:
-            return torch.sigmoid(x)
 
     def theta_sym(R):
         """螺旋线方程"""
         return torch.log(R / r_g) / torch.tan(alpha) + theta_offset
 
     def H_func(R, theta):
-        """膜厚分布函数"""
-        periodic_offsets = [0, -2*np.pi/K_val, -4*np.pi/K_val, 2*np.pi/K_val, 4*np.pi/K_val]
+        """膜厚分布函数 — 纯sigmoid过渡"""
+        periodic_offsets = [0, -2 * np.pi / K_val, -4 * np.pi / K_val,
+                           2 * np.pi / K_val, 4 * np.pi / K_val]
         periodic_terms = []
         for offset in periodic_offsets:
-            term = (_step_fn((theta - theta_sym(R) + offset) / xi_theta) *
-                   _step_fn((theta_sym(R) - theta + 2*np.pi/K_val*groove_ratio - offset) / xi_theta))
+            term = (torch.sigmoid((theta - theta_sym(R) + offset) / xi_theta) *
+                    torch.sigmoid((theta_sym(R) - theta + 2 * np.pi / K_val * groove_ratio - offset) / xi_theta))
             periodic_terms.append(term)
 
-        is_texture = (_step_fn((R - R_d_1) / xi_R) *
-                     _step_fn((R_d_2 - R) / xi_R) *
-                     sum(periodic_terms))
+        is_texture = (torch.sigmoid((R - R_d_1) / xi_R) *
+                      torch.sigmoid((R_d_2 - R) / xi_R) *
+                      sum(periodic_terms))
 
         H = 1.0 * (1 - is_texture) + (1.0 + h_texture / h_i) * is_texture
         return H
@@ -197,25 +177,19 @@ def create_H_func(params, cfg: Config):
 # 4. PDE残差模型
 # =============================================================================
 def create_pde_models(H_func, params, cfg: Config = None):
-    """创建PDE残差函数 (PyTorch版)
+    """创建PDE残差函数 — 标准Reynolds方程, 无控梯策略
 
-    方法ABC组合控梯策略:
-        A. detach(H) 用于楔形项, 截断 ∂H/∂θ 对网络参数的梯度
-        B. w_wedge 课程权重
-        C. 逐点权重 ∝ 1/(1+|∂H/∂θ|/mean)
+    不包含:
+      - stop_gradient (detach H)
+      - w_wedge 课程学习
+      - point_weight 逐点降权
+      - 稳定项 τ*τ_2
+    回归最简单的PINN PDE残差形式。
     """
     Lambda = params['Lambda']
-    device = Lambda.device
-
-    # 可调控件
-    use_sg = getattr(cfg, 'use_stop_gradient_H', True)
-    use_pw = getattr(cfg, 'use_point_weight', True)
-
-    # w_wedge 状态 (通过闭包管理，避免 nn.Parameter 被优化器更新)
-    w_wedge_state = {'val': getattr(cfg, 'w_wedge_init', 1e-2)}
 
     def f_model_FBNS(u_model, R, theta):
-        """Reynolds方程残差 + JFO稳定项 (ABC组合)"""
+        """标准 Reynolds 方程残差 (简单版)"""
         p, gamma = u_model(torch.cat([R, theta], dim=1))
         H = H_func(R, theta)
 
@@ -229,15 +203,17 @@ def create_pde_models(H_func, params, cfg: Config = None):
             create_graph=True, retain_graph=True
         )[0]
 
-        # ── 方法A: detach 截断楔形项中 H 的参数梯度 ──
+        # ∂H/∂θ (楔形项)
         H_theta = torch.autograd.grad(
             H, theta, grad_outputs=torch.ones_like(H),
             create_graph=True, retain_graph=True
         )[0]
-        H_mult = H
-        if use_sg:
-            H_theta = H_theta.detach()
-            H_mult = H.detach()
+
+        # γ 的 θ 导数
+        gamma_theta = torch.autograd.grad(
+            gamma, theta, grad_outputs=torch.ones_like(gamma),
+            create_graph=True, retain_graph=True
+        )[0]
 
         # Poiseuille 扩散项
         term1 = R * H**3 * p_R
@@ -252,46 +228,11 @@ def create_pde_models(H_func, params, cfg: Config = None):
             create_graph=True, retain_graph=True
         )[0] / R**2
 
-        # ── 方法B: 课程权重 w_wedge ──
-        w = w_wedge_state['val']
-        gamma_theta = torch.autograd.grad(
-            gamma, theta, grad_outputs=torch.ones_like(gamma),
-            create_graph=True, retain_graph=True
-        )[0]
+        # 楔形效应项 (直接使用, 无课程权重)
+        part_3_1 = -Lambda * H_theta
+        part_3_2 = -Lambda * (-(gamma_theta * H + gamma * H_theta))
 
-        # 楔形效应项
-        part_3_1 = -Lambda * H_theta * w
-        part_3_2 = -Lambda * (-(gamma_theta * H_mult + gamma * H_theta)) * w
-
-        # 稳定项
-        div_gamma = gamma_theta
-        div_2_gamma = torch.autograd.grad(
-            div_gamma, theta, grad_outputs=torch.ones_like(div_gamma),
-            create_graph=True, retain_graph=True
-        )[0]
-        div_p = p_theta
-
-        epsilon = 0.1
-        tau = (torch.abs(div_gamma) - div_gamma) * epsilon
-        tau = tau.detach()
-        tau_2 = (div_p - torch.abs(div_p)) * epsilon
-        tau_2 = tau_2.detach()
-
-        f_p_raw = part_1 + part_2 + part_3_1 + part_3_2 + div_2_gamma * tau * tau_2
-
-        # ── 方法C: 逐点权重 ──
-        if use_pw:
-            H_theta_full = torch.autograd.grad(
-                H, theta, grad_outputs=torch.ones_like(H),
-                create_graph=False, retain_graph=False
-            )[0]
-            mean_grad = torch.mean(torch.abs(H_theta_full)) + 1e-8
-            point_weight = 1.0 / (1.0 + torch.abs(H_theta_full) / mean_grad)
-            point_weight = point_weight.detach()
-            f_p = point_weight * f_p_raw
-        else:
-            f_p = f_p_raw
-
+        f_p = part_1 + part_2 + part_3_1 + part_3_2
         return f_p
 
     def f_model_FB(u_model, R, theta):
@@ -299,9 +240,9 @@ def create_pde_models(H_func, params, cfg: Config = None):
         p, gamma = u_model(torch.cat([R, theta], dim=1))
         return p + gamma - torch.sqrt(p**2 + gamma**2)
 
+    # 兼容旧接口: set_w_wedge 为 no-op
     def set_w_wedge(new_val):
-        """更新楔形项课程权重"""
-        w_wedge_state['val'] = new_val
+        pass
 
     return f_model_FBNS, f_model_FB, set_w_wedge
 
@@ -475,8 +416,7 @@ def main():
         none_zero=False, adapt_True=False,
         isAdaptive=False, MTL_adapt=False, PCGrad_true=True, Boundary_true=False,
         R_range=params['R_lim'], theta_range=params['theta_lim'],
-        bc_switch=cfg.bc_switch, num_freq=cfg.num_fourier_freq,
-        embed_dim=cfg.embed_dim
+        bc_switch=cfg.bc_switch, batch_size=cfg.batch_size
     )
 
     # 创建输出目录

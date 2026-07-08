@@ -1,4 +1,4 @@
-from .networks import FourierDecoupledPINN
+from .networks import FourierDecoupledPINN, SimpleMLPPINN
 from .solver import TorchCollocationSolver
 from .domains import DomainND
 from .boundaries import dirichletBC
@@ -18,6 +18,7 @@ from .pcgrad import pcgrad
 
 __all__ = [
     "FourierDecoupledPINN",
+    "SimpleMLPPINN",
     "TorchCollocationSolver",
     "DomainND",
     "dirichletBC",
