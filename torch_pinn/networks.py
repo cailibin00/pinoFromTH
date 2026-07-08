@@ -119,7 +119,7 @@ class FourierDecoupledPINN(nn.Module):
 
 
 class SimpleMLPPINN(nn.Module):
-    """Vanilla MLP PINN — no Fourier encoding, no decoupled branches.
+    """MLP PINN — no Fourier encoding, no decoupled branches.
 
     Input:  [R_norm, theta_norm]  (both normalized to [-1, 1])
     Output: [P, gamma]            (both ∈ [0, 1] via tanh²)
@@ -127,23 +127,61 @@ class SimpleMLPPINN(nn.Module):
     Supports two BC modes:
       bc_switch=1: hard BC — g_net(R) + sigma(R) * nn_p  (original approach)
       bc_switch=2: soft BC — direct output (BC via loss penalty)
+
+    If residual=True, consecutive same-width hidden layers are grouped into
+    ResNet-style blocks (2 layers per block, skip connection around each block).
+    This gives gradients a direct path during backprop — especially helpful for
+    PINNs where second-order autograd derivatives weaken gradient signals.
     """
 
-    def __init__(self, layer_sizes, bc_values, r_lim, theta_lim, bc_switch=1):
+    def __init__(self, layer_sizes, bc_values, r_lim, theta_lim,
+                 bc_switch=1, residual=True):
         super().__init__()
         self.r_lim = r_lim
         self.theta_lim = theta_lim
         self.bc_switch = bc_switch
-        self.bc_values = bc_values  # [P_i, P_o]
+        self.bc_values = bc_values
 
-        layers = []
-        for i in range(len(layer_sizes) - 1):
-            layers.append(nn.Linear(layer_sizes[i], layer_sizes[i + 1]))
-            if i < len(layer_sizes) - 2:
-                layers.append(nn.Tanh())
-        self.net = nn.Sequential(*layers)
+        # Build body: first layer projects to hidden width, then residual blocks,
+        # then final layer projects to output width.
+        sizes = list(layer_sizes)
+        input_dim = sizes[0]
+        hidden_width = sizes[1]
+        output_dim = sizes[-1]
+        middle_sizes = sizes[2:-1]  # all should == hidden_width
 
-        # Hard BC: small trainable network for boundary pressure profile
+        self.input_proj = nn.Sequential(
+            nn.Linear(input_dim, hidden_width),
+            nn.Tanh(),
+        )
+
+        if residual and len(middle_sizes) >= 2:
+            # Group consecutive same-width layers into 2-layer residual blocks
+            self.residual_blocks = nn.ModuleList()
+            for i in range(0, len(middle_sizes) - 1, 2):
+                block = nn.Sequential(
+                    nn.Linear(hidden_width, middle_sizes[i]),
+                    nn.Tanh(),
+                    nn.Linear(middle_sizes[i], middle_sizes[i + 1]),
+                    nn.Tanh(),
+                )
+                self.residual_blocks.append(block)
+            self._use_residual = True
+        else:
+            # Fallback: plain stacked layers
+            plain_layers = []
+            for i in range(len(middle_sizes)):
+                plain_layers.append(nn.Linear(
+                    hidden_width if i == 0 else middle_sizes[i - 1],
+                    middle_sizes[i]
+                ))
+                plain_layers.append(nn.Tanh())
+            self.plain_body = nn.Sequential(*plain_layers)
+            self._use_residual = False
+
+        self.output_proj = nn.Linear(hidden_width, output_dim)
+
+        # Hard BC
         if bc_switch == 1:
             self.g_net = nn.Sequential(
                 nn.Linear(1, 8),
@@ -169,7 +207,16 @@ class SimpleMLPPINN(nn.Module):
         r_norm = self._normalize(r, self.r_lim)
         theta_norm = self._normalize(theta, self.theta_lim)
         x = torch.cat([r_norm, theta_norm], dim=1)
-        out = self.net(x)
+
+        # Body
+        x = self.input_proj(x)
+        if self._use_residual:
+            for block in self.residual_blocks:
+                x = x + block(x)   # ← skip connection
+        else:
+            x = self.plain_body(x)
+        out = self.output_proj(x)
+
         nn_p = out[:, 0:1]
         nn_gamma = out[:, 1:2]
 

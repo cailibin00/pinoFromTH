@@ -33,7 +33,15 @@ def train_model_torch(model, cfg, N_f_true):
         {'boundaries': [20000, 40000], 'values': [1e-5, 1e-5, 1e-6]},
     ]
 
+    # w_wedge schedule: 阶段升温, 从 1% 到 100% 恢复完整楔形物理
+    w_wedge_schedule = [1e-2, 5e-2, 2e-1, 1.0]
+
     for stage_idx, schedule in enumerate(lr_schedules):
+        # Update wedge weight for this stage
+        if hasattr(model, 'set_w_wedge') and model.set_w_wedge is not None:
+            w_val = w_wedge_schedule[stage_idx]
+            model.set_w_wedge(w_val)
+            print(f"[Stage {stage_idx + 1}/4] w_wedge = {w_val:.0e}")
         N_train = getattr(cfg, 'N_train', 5000)
         NL_train = getattr(cfg, 'NL_train', 4)
 

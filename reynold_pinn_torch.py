@@ -76,6 +76,7 @@ class Config:
     # ── 模型架构开关 ──
     u_model_switch = 8     # 8=SimpleMLPPINN (vanilla MLP), 13=FourierDecoupledPINN
     bc_switch = 1          # 1=硬约束BC (g_net+hermite σ, 原始方案), 2=纯软约束
+    residual = True        # 残差连接 (skip connection), 缓解深层网络的梯度衰减
     num_fourier_freq = 4   # (仅switch=13使用) Fourier特征频率数
     embed_dim = 64         # (仅switch=13使用) R/θ MLP编码输出维度
 
@@ -179,21 +180,21 @@ def create_H_func(params, cfg: Config):
 # 4. PDE残差模型
 # =============================================================================
 def create_pde_models(H_func, params, cfg: Config = None):
-    """创建PDE残差函数 — 标准Reynolds方程, 无控梯策略
+    """创建PDE残差函数 — 标准Reynolds方程 + 简单楔形缩放
 
-    不包含:
-      - stop_gradient (detach H)
-      - w_wedge 课程学习
-      - point_weight 逐点降权
-      - 稳定项 τ*τ_2
-    回归最简单的PINN PDE残差形式。
+    楔形项 -Λ·∂H/∂θ 在 sigmoid 槽边界处可达 ~21600, 远超扩散项量级.
+    通过可动态调整的 w_wedge 在训练早期抑制该项, 后期恢复完整物理.
     """
     Lambda = params['Lambda']
 
+    # 可动态调整的楔形权重 (通过 set_w_wedge 在 stage 间递增)
+    w_wedge_state = {'val': 1e-2}
+
     def f_model_FBNS(u_model, R, theta):
-        """标准 Reynolds 方程残差 (简单版)"""
+        """Reynolds 方程残差"""
         p, gamma = u_model(torch.cat([R, theta], dim=1))
         H = H_func(R, theta)
+        w = w_wedge_state['val']
 
         # 压力梯度
         p_R = torch.autograd.grad(
@@ -205,7 +206,7 @@ def create_pde_models(H_func, params, cfg: Config = None):
             create_graph=True, retain_graph=True
         )[0]
 
-        # ∂H/∂θ (楔形项)
+        # ∂H/∂θ
         H_theta = torch.autograd.grad(
             H, theta, grad_outputs=torch.ones_like(H),
             create_graph=True, retain_graph=True
@@ -230,9 +231,9 @@ def create_pde_models(H_func, params, cfg: Config = None):
             create_graph=True, retain_graph=True
         )[0] / R**2
 
-        # 楔形效应项 (直接使用, 无课程权重)
-        part_3_1 = -Lambda * H_theta
-        part_3_2 = -Lambda * (-(gamma_theta * H + gamma * H_theta))
+        # 楔形效应项 (w_wedge 阶段升温: 0.01→0.05→0.2→1.0)
+        part_3_1 = -Lambda * H_theta * w
+        part_3_2 = -Lambda * (-(gamma_theta * H + gamma * H_theta)) * w
 
         f_p = part_1 + part_2 + part_3_1 + part_3_2
         return f_p
@@ -242,9 +243,8 @@ def create_pde_models(H_func, params, cfg: Config = None):
         p, gamma = u_model(torch.cat([R, theta], dim=1))
         return p + gamma - torch.sqrt(p**2 + gamma**2)
 
-    # 兼容旧接口: set_w_wedge 为 no-op
     def set_w_wedge(new_val):
-        pass
+        w_wedge_state['val'] = new_val
 
     return f_model_FBNS, f_model_FB, set_w_wedge
 
@@ -445,7 +445,8 @@ def main():
         none_zero=False, adapt_True=False,
         isAdaptive=False, MTL_adapt=False, PCGrad_true=True, Boundary_true=False,
         R_range=params['R_lim'], theta_range=params['theta_lim'],
-        bc_switch=cfg.bc_switch, batch_size=cfg.batch_size
+        bc_switch=cfg.bc_switch, batch_size=cfg.batch_size,
+        residual=cfg.residual
     )
 
     # 创建输出目录

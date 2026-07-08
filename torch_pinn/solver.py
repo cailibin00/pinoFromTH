@@ -34,7 +34,7 @@ class TorchCollocationSolver:
                 Boundary_true=False,
                 R_range=None, theta_range=None,
                 bc_switch=1, num_freq=4, embed_dim=64,
-                batch_size=None):
+                batch_size=None, residual=True):
         """Compile the solver with model architecture and PDE configuration.
 
         Args:
@@ -75,6 +75,7 @@ class TorchCollocationSolver:
         self.embed_dim = embed_dim
         self.batch_size = batch_size if (batch_size and batch_size > 0) else None
         self.u_model_switch = u_model_switch
+        self.residual = residual
 
         # Extract domain points
         self.domain_X_f = np.asarray(self.domain.X_f, dtype=np.float32)
@@ -88,6 +89,7 @@ class TorchCollocationSolver:
                 R_range,
                 theta_range,
                 bc_switch=bc_switch,
+                residual=residual,
             ).to(self.device)
         else:  # switch == 13
             self.u_model = FourierDecoupledPINN(
@@ -405,8 +407,9 @@ class TorchCollocationSolver:
             'num_freq': self.num_freq,
             'embed_dim': self.embed_dim,
             'u_model_switch': self.u_model_switch,
+            'residual': self.residual,
         }
-        if self.u_model_switch == 13:
+        if self.u_model_switch in (8, 13):
             payload['bc_values'] = self._extract_bc_values()
         torch.save(payload, os.path.join(model_path, "model.pt"))
 
@@ -423,6 +426,7 @@ class TorchCollocationSolver:
         self.num_freq = payload.get('num_freq', 4)
         self.embed_dim = payload.get('embed_dim', 64)
         self.u_model_switch = payload.get('u_model_switch', 13)
+        residual = payload.get('residual', True)
 
         if self.u_model_switch == 8:
             bc_values = payload.get('bc_values', [0.0, 0.0])
@@ -430,6 +434,7 @@ class TorchCollocationSolver:
                 self.layer_sizes, bc_values,
                 self.R_range, self.theta_range,
                 bc_switch=self.bc_switch,
+                residual=residual,
             ).to(self.device)
         else:
             bc_values = payload.get('bc_values', [0.0, 0.0])
