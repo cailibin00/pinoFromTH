@@ -13,6 +13,7 @@ from .utils import (
     multimesh,
     flatten_and_stack,
     ensure_dir,
+    Tee,
 )
 from .pcgrad import pcgrad
 
@@ -33,4 +34,5 @@ __all__ = [
     "flatten_and_stack",
     "ensure_dir",
     "pcgrad",
+    "Tee",
 ]

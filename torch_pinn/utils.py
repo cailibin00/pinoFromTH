@@ -1,5 +1,36 @@
+import os
+import sys
 import numpy as np
 import torch
+
+
+class Tee:
+    """Simultaneously write to a file and the original stdout.
+
+    Usage:
+        tee = Tee("path/to/log.txt")
+        sys.stdout = tee
+        ...  # all print() goes to both console and file
+        sys.stdout = tee.stdout  # restore
+        tee.close()
+    """
+
+    def __init__(self, file_path):
+        os.makedirs(os.path.dirname(file_path) or ".", exist_ok=True)
+        self.file = open(file_path, "w", encoding="utf-8")
+        self.stdout = sys.stdout
+
+    def write(self, data):
+        self.file.write(data)
+        self.file.flush()
+        self.stdout.write(data)
+
+    def flush(self):
+        self.file.flush()
+        self.stdout.flush()
+
+    def close(self):
+        self.file.close()
 
 
 def mse(pred, target, weights=None):

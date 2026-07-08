@@ -22,6 +22,7 @@ from torch_pinn import (
     dirichletBC,
     train_model_torch,
     piecewise_lr,
+    Tee,
 )
 
 # =============================================================================
@@ -32,6 +33,7 @@ OUTPUT_DIR = os.path.join(SCRIPT_DIR, "output_torch")
 CHECKPOINT_DIR = os.path.join(OUTPUT_DIR, "checkpoints")
 MODEL_DIR = os.path.join(OUTPUT_DIR, "models")
 FIGURE_DIR = os.path.join(OUTPUT_DIR, "figures")
+LOG_DIR = os.path.join(OUTPUT_DIR, "log")
 
 # =============================================================================
 # 1. 配置参数
@@ -383,9 +385,36 @@ def plot_results(model, params, cfg: Config, H_func, save_prefix='result'):
 # 7. 主程序
 # =============================================================================
 def main():
+    import sys
+
+    # ── 设置日志 ──
+    os.makedirs(LOG_DIR, exist_ok=True)
+    log_path = os.path.join(LOG_DIR, "train.txt")
+    tee = Tee(log_path)
+    sys.stdout = tee
+
     # 初始化配置
     cfg = Config()
     params = compute_physical_params(cfg)
+
+    # 打印配置摘要
+    print("=" * 60)
+    print("PINN Training Configuration")
+    print("=" * 60)
+    print(f"  Architecture:    SimpleMLPPINN (switch={cfg.u_model_switch})")
+    print(f"  BC mode:         {'hard (g_net+hermite σ)' if cfg.bc_switch == 1 else 'soft (loss penalty)'}")
+    print(f"  H transition:    {cfg.h_step_type}")
+    print(f"  Layer sizes:     {cfg.layer_sizes}")
+    print(f"  Collocation N_f: {cfg.N_f}")
+    print(f"  Groove boundary: {cfg.N_groove_b} (spiral) + {cfg.N_groove_r} (radial)")
+    print(f"  Domain fidelity: {cfg.domain_fidelity}")
+    print(f"  N_train/outer:   {cfg.N_train}")
+    print(f"  NL_train (RAD):  {cfg.NL_train}")
+    print(f"  RAD ratios:      {cfg.ratio_RAD_list}")
+    print(f"  Batch size:      {cfg.batch_size if cfg.batch_size else 'full-batch'}")
+    print(f"  PCGrad:          True")
+    print(f"  Log file:        {log_path}")
+    print("=" * 60)
 
     # 创建膜厚函数和PDE模型
     H_func, theta_sym = create_H_func(params, cfg)
@@ -435,6 +464,17 @@ def main():
     print("Starting training (PyTorch)...")
     model = train_model_torch(model, cfg, N_f_true)
 
+    # ── 保存训练日志 ──
+    import json
+    loss_log_path = os.path.join(LOG_DIR, "loss_history.json")
+    with open(loss_log_path, "w") as f:
+        json.dump({
+            "epoch": model.epoch_history,
+            "total_loss": model.loss_history,
+            "loss_components": [[float(v) for v in row] for row in model.loss_all_history],
+        }, f, indent=2)
+    print(f"Loss history saved to: {loss_log_path}")
+
     # 保存模型
     model_name = f'reynolds_pinn_N{cfg.N_f}_iter{cfg.N_train*cfg.NL_train*4}'
     model_path = os.path.join(MODEL_DIR, model_name)
@@ -446,6 +486,10 @@ def main():
     os.makedirs(fig_dir, exist_ok=True)
     fig_prefix = os.path.join(fig_dir, model_name)
     plot_results(model, params, cfg, H_func, save_prefix=fig_prefix)
+
+    # ── 恢复 stdout ──
+    sys.stdout = tee.stdout
+    tee.close()
 
     return model
 
