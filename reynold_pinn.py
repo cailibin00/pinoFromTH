@@ -125,7 +125,8 @@ def compute_physical_params(cfg: Config):
 def create_H_func(params, cfg: Config):
     """创建膜厚函数 H(R, theta)
 
-    使用 C¹ 分段三次 Hermite 平滑过渡, 过渡区外精确为 0/1.
+    使用可学习过渡宽度的 sigmoid 平滑.
+    ξ_theta / ξ_R 为 trainable tf.Variable, 优化器会自动寻找 PDE 残差最小的宽度.
     """
     R_d_1 = params['R_d_1']
     R_d_2 = params['R_d_2']
@@ -136,38 +137,45 @@ def create_H_func(params, cfg: Config):
     groove_ratio = params['groove_ratio']
     K_val = float(params['K'].numpy())
 
-    # 平滑参数 (过渡区宽度)
-    R_xi = 100.0
-    xi_R = (params['R_lim'][1] - params['R_lim'][0]) / R_xi
-    xi_theta = (params['theta_lim'][1] - params['theta_lim'][0]) / 50.0
+    domain_width_R = params['R_lim'][1] - params['R_lim'][0]
+    domain_width_theta = params['theta_lim'][1] - params['theta_lim'][0]
     theta_offset = np.pi / 6
 
-    def _step_fn(x):
-        """Hermite 三次: h(t)=3t²-2t³, t∈[0,1]. C¹ 光滑."""
-        t = tf.clip_by_value(x, 0.0, 1.0)
-        return 3 * t**2 - 2 * t**3
+    # 可学习 log-宽度 (log 空间保证正值, 初值: 域宽的 2~3%)
+    log_xi_theta = tf.Variable(
+        tf.math.log(domain_width_theta / 30.0),   # init ≈ 3.3%
+        trainable=True, dtype=tf.float32, name='log_xi_theta'
+    )
+    log_xi_R = tf.Variable(
+        tf.math.log(domain_width_R / 40.0),        # init ≈ 2.5%
+        trainable=True, dtype=tf.float32, name='log_xi_R'
+    )
 
     def theta_sym(R):
         """螺旋线方程"""
         return tf.math.log(R / r_g) / tf.math.tan(alpha) + theta_offset
 
     def H_func(R, theta):
-        """膜厚分布函数"""
+        """膜厚分布函数, sigmoid 平滑, 宽度由 learnable ξ 控制"""
+        xi_theta = tf.exp(log_xi_theta)
+        xi_R = tf.exp(log_xi_R)
+
         periodic_offsets = [0, -2*np.pi/K_val, -4*np.pi/K_val, 2*np.pi/K_val, 4*np.pi/K_val]
         periodic_terms = []
         for offset in periodic_offsets:
-            term = (_step_fn((theta - theta_sym(R) + offset) / xi_theta) *
-                   _step_fn((theta_sym(R) - theta + 2*np.pi/K_val*groove_ratio - offset) / xi_theta))
+            term = (tf.math.sigmoid((theta - theta_sym(R) + offset) / xi_theta) *
+                    tf.math.sigmoid((theta_sym(R) - theta + 2*np.pi/K_val*groove_ratio - offset) / xi_theta))
             periodic_terms.append(term)
 
-        is_texture = (_step_fn((R - R_d_1) / xi_R) *
-                     _step_fn((R_d_2 - R) / xi_R) *
-                     sum(periodic_terms))
+        is_texture = (tf.math.sigmoid((R - R_d_1) / xi_R) *
+                      tf.math.sigmoid((R_d_2 - R) / xi_R) *
+                      sum(periodic_terms))
 
         H = 1.0 * (1 - is_texture) + (1.0 + h_texture / h_i) * is_texture
         return H
 
-    return H_func, theta_sym
+    xi_vars = [log_xi_theta, log_xi_R]
+    return H_func, theta_sym, xi_vars
 
 
 # =============================================================================
@@ -260,7 +268,9 @@ def generate_groove_points(theta_sym, params, cfg: Config):
 # 6. 训练流程
 # =============================================================================
 def train_model(model, cfg: Config, N_f_true):
-    """多阶段训练流程 (朴素版)"""
+    """多阶段训练流程 (ξ 自适应宽度)"""
+    has_xi = hasattr(model, 'xi_vars') and model.xi_vars
+
     lr_schedules = [
         {'boundaries': [20000, 40000], 'values': [1e-3, 1e-4, 1e-5]},
         {'boundaries': [20000, 40000], 'values': [1e-4, 1e-4, 1e-5]},
@@ -285,7 +295,51 @@ def train_model(model, cfg: Config, N_f_true):
                 k=1, c=1e-16
             )
 
+            # ── ξ 自适应优化: 梯度下降找最优过渡宽度 ──
+            if has_xi:
+                _optimize_xi_step(model)
+
     return model
+
+
+def _optimize_xi_step(model, n_batch=1000, n_steps=50, lr_xi=5e-4):
+    """对 ξ_theta, ξ_R 做梯度下降, 最小化 PDE 残差的 MSE.
+
+    原理: ∂L_PDE/∂ξ = ∂(mean(f_p²))/∂ξ, 优化器自动平衡:
+      - ξ 太小 → ∂H/∂θ 太陡 → f_p 爆炸 → 推大 ξ
+      - ξ 太大 → 膜厚过渡模糊 → H 偏离真值 → 也增大 f_p → 推小 ξ
+    """
+    X_all = model.domain.X_f  # (N, 2): [R, theta]
+    n_total = len(X_all)
+    f_raw = model.f_model_FBNS_raw
+
+    # 随机采样
+    idx = np.random.choice(n_total, min(n_batch, n_total), replace=False)
+    R_batch = tf.constant(X_all[idx, 0:1], dtype=tf.float32)
+    theta_batch = tf.constant(X_all[idx, 1:2], dtype=tf.float32)
+
+    # 临时降 LR 做内循环优化
+    old_lr = model.xi_optimizer.learning_rate
+    model.xi_optimizer.learning_rate = lr_xi
+
+    for _ in range(n_steps):
+        with tf.GradientTape() as tape:
+            f_p = f_raw(model.u_model, R_batch, theta_batch)
+            loss_xi = tf.reduce_mean(tf.square(f_p))
+        grads = tape.gradient(loss_xi, model.xi_vars)
+        # 过滤 None 梯度
+        grads_vars = [(g, v) for g, v in zip(grads, model.xi_vars) if g is not None]
+        if grads_vars:
+            model.xi_optimizer.apply_gradients(grads_vars)
+            # 剪切到合理范围 (log空间: 域宽的 0.5%~10%)
+            for v in model.xi_vars:
+                v.assign(tf.clip_by_value(v, -8.0, -2.0))  # exp(-8)≈0.03%, exp(-2)≈13%
+
+    model.xi_optimizer.learning_rate = old_lr
+
+    xi_theta = tf.exp(model.xi_vars[0]).numpy()
+    xi_R = tf.exp(model.xi_vars[1]).numpy()
+    print(f"  [ξ adaptive] ξ_theta={xi_theta:.4f}  ξ_R={xi_R:.4f}")
 
 
 # =============================================================================
@@ -369,7 +423,7 @@ def plot_results(model, params, cfg: Config, save_prefix='result'):
     
     # 5. 绘图 - 膜厚 H (H_only)
     # 为了计算H，需要重新获取或传入H_func。
-    H_func_plot, _ = create_H_func(params, cfg)
+    H_func_plot, _, _ = create_H_func(params, cfg)
     
     # 将 numpy 的 meshgrid 转换为 tensor 用于计算
     X_tf = tf.constant(X, dtype=tf.float32)
@@ -416,7 +470,7 @@ def main():
     params = compute_physical_params(cfg)
     
     # 创建膜厚函数和PDE模型
-    H_func, theta_sym = create_H_func(params, cfg)
+    H_func, theta_sym, xi_vars = create_H_func(params, cfg)
     f_model_FBNS, f_model_FB = create_pde_models(H_func, params)
 
     # 创建计算域
@@ -457,6 +511,9 @@ def main():
     # 设置额外模型
     model.f_model_FB = tf.function(f_model_FB)
     model.f_model_list = [get_tf_model(f_model_FBNS)]
+    model.f_model_FBNS_raw = f_model_FBNS   # 保留原始版本供 ξ 优化
+    model.xi_vars = xi_vars
+    model.xi_optimizer = tf.keras.optimizers.Adam(1e-4)  # ξ 独立优化器 (小 LR)
 
     # 训练
     print("Starting training...")

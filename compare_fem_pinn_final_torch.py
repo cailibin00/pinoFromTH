@@ -12,6 +12,10 @@ import argparse
 import numpy as np
 import torch
 import matplotlib.pyplot as plt
+
+# 选择显卡: 改数字即可, 0=第一张, 1=第二张, 'cpu'=不用显卡
+CUDA_DEVICE = 0
+torch.cuda.set_device(CUDA_DEVICE) if torch.cuda.is_available() else None
 import matplotlib.ticker as ticker
 from matplotlib import cm
 
@@ -101,19 +105,28 @@ def load_pinn_and_predict(model_path: str, coords: np.ndarray, cfg: Config, para
     lower_bc = dirichletBC(Domain, val=params["P_i"], var="R", target="lower")
     upper_bc = dirichletBC(Domain, val=params["P_o"], var="R", target="upper")
 
-    model = TorchCollocationSolver()
-    model.compile(
-        cfg.layer_sizes, [f_model_FBNS], Domain, [lower_bc, upper_bc],
-        u_model_switch=cfg.u_model_switch, two_output=True, none_zero=False,
-        adapt_True=False, isAdaptive=False, MTL_adapt=False, PCGrad_true=True,
-        Boundary_true=False,
-        R_range=params["R_lim"], theta_range=params["theta_lim"],
-        bc_switch=cfg.bc_switch, num_freq=cfg.num_fourier_freq,
-        embed_dim=cfg.embed_dim
-    )
-
-    # 载入权重
-    model.load_weights(model_path)
+    # 推理：先尝试 GPU，OOM 时自动回退 CPU
+    for dev in ["cuda", "cpu"]:
+        try:
+            model = TorchCollocationSolver(device=dev)
+            model.compile(
+                cfg.layer_sizes, [f_model_FBNS], Domain, [lower_bc, upper_bc],
+                u_model_switch=cfg.u_model_switch, two_output=True, none_zero=False,
+                adapt_True=False, isAdaptive=False, MTL_adapt=False, PCGrad_true=True,
+                Boundary_true=False,
+                R_range=params["R_lim"], theta_range=params["theta_lim"],
+                bc_switch=cfg.bc_switch, num_freq=cfg.num_fourier_freq,
+                embed_dim=cfg.embed_dim
+            )
+            # 载入权重
+            model.load_weights(model_path)
+            break
+        except RuntimeError as e:
+            if "out of memory" in str(e) and dev == "cuda":
+                torch.cuda.empty_cache()
+                print(f"[PINN] GPU OOM，回退 CPU ...")
+                continue
+            raise
     print(f"[PINN] 权重加载自: {model_path}")
 
     # 推理
@@ -358,7 +371,9 @@ def main():
 
     print("\n[2/4] 加载 PINN 并推理...")
     coords = np.stack([R_pts, T_pts], axis=1).astype(np.float32)
-    P_pinn, G_pinn = load_pinn_and_predict(args.model_path, coords, cfg, params)
+    torch.cuda.empty_cache()
+    with torch.no_grad():
+        P_pinn, G_pinn = load_pinn_and_predict(args.model_path, coords, cfg, params)
 
     nR, nT = len(R_uniq), len(T_uniq)
     P_pinn_grid = P_pinn.reshape(nR, nT)

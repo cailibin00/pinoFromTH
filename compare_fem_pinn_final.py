@@ -105,8 +105,8 @@ def load_pinn_and_predict(model_path: str, coords: np.ndarray, cfg: Config, para
     from tensordiffeq.domains import DomainND
 
     # 重建与训练时完全一致的 model 结构
-    H_func, theta_sym = create_H_func(params, cfg)
-    f_model_FBNS, f_model_FB, set_w_wedge = create_pde_models(H_func, params, cfg)
+    H_func, theta_sym, _ = create_H_func(params, cfg)
+    f_model_FBNS, f_model_FB = create_pde_models(H_func, params)
 
     Domain = DomainND(["R", "theta"])
     Domain.add("R",     params["R_lim"],     cfg.domain_fidelity)

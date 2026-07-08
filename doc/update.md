@@ -76,13 +76,37 @@ P = tanh( g(R) + σ(R)·NN_P )²
 
 ---
 
-## 3. PDE 残差与训练：不变
+## 3. 自适应膜厚过渡宽度
 
-- PDE 残差公式完全不变: Poiseuille + 楔形 + τ稳定化
-- 训练流程完全不变: 4阶段分段LR + PCGrad + RAD重采样
-- 损失函数不变: `L_total = w₁·L_Reynolds + w₂·L_FB + w₃·L_BC`
+放弃 hermite, 回归 sigmoid — 但把过渡宽度 ξ 做成可训练变量.
 
-**核心信念**: Fourier 输入 + 简洁硬 BC 已经足够好, 不需要额外的梯度操纵或课程学习。
+### 原理
+
+```python
+log_ξ_theta = tf.Variable(log(域宽/30))  # 初值 ≈ 3.3%
+log_ξ_R     = tf.Variable(log(域宽/40))  # 初值 ≈ 2.5%
+
+H 中的 sigmoid: σ((θ − θ_sym(R)) / exp(log_ξ_theta))
+```
+
+### 优化
+
+每个 RAD 重采样后, 对 ξ 做 50 步梯度下降:
+
+```python
+loss_ξ = MSE(f_p, 0)  # 跟主网络共享同一个优化目标
+```
+
+优化器自动平衡:
+- ξ 太小 → ∂H/∂θ 太陡 → f_p 爆炸 → 梯度推大 ξ
+- ξ 太大 → 膜厚模糊 → H 偏离真值 → 也增大 f_p → 梯度推小 ξ
+
+ξ 被剪切在 `[exp(-8), exp(-2)]` ≈ `[0.03%, 13%]` 域宽之间.
+
+### 效果
+
+- ξ 在每个 RAD 循环后自适应调整, 随着训练进度梯度变小 ξ 可逐渐收窄
+- 不需要手动调宽度, 不需要课程学习
 
 ---
 
@@ -90,7 +114,6 @@ P = tanh( g(R) + σ(R)·NN_P )²
 
 ### `tensordiffeq/networks.py`
 - 新增 `new_neural_fourier_decoupled()` — 约 115 行
-- 旧函数全部保留不动
 
 ### `tensordiffeq/models.py`
 - `compile()` 新增 `num_freq=4, embed_dim=64` 参数
@@ -98,11 +121,13 @@ P = tanh( g(R) + σ(R)·NN_P )²
 
 ### `reynold_pinn.py`
 - Config: 新增 `u_model_switch=13`, `num_fourier_freq=4`, `embed_dim=64`
-- `create_H_func`: 去掉了 step_type 开关, 固定使用 Hermite 三次过渡
-- `create_pde_models`: 回归标准版, 去掉了 w_wedge/stop_gradient/point_weight
-- `train_model`: 回归朴素版, 去掉 w_wedge 课程
-- `main`: 简化调用链, `u_model_switch`/`num_freq`/`embed_dim` 从 Config 读取
+- `create_H_func`: 回归 sigmoid, 过渡宽度 ξ 做成可学习 `tf.Variable` (log 空间)
+- `create_pde_models`: 标准版, 无 stop_gradient/point_weight
+- `train_model` / `_optimize_xi_step`: 每 RAD 后对 ξ 做梯度下降
 - `layer_sizes`: `[2, 128, 128, 128, 128, 128, 2]` (6层)
+
+### `compare_fem_pinn_final.py` / `compare_fem_pinn_iso_v16.py`
+- 同步更新 `create_H_func` 返回值解构 (2→3), `create_pde_models` (3→2)
 
 ---
 
@@ -112,6 +137,4 @@ P = tanh( g(R) + σ(R)·NN_P )²
 python reynold_pinn.py
 ```
 
-默认使用新架构 (`u_model_switch=13`)。回退旧架构: 在 Config 中设 `u_model_switch=8`。
-
-**注意**: 对比脚本 `compare_fem_pinn_final.py` 中硬编码了 `u_model_switch=8`。切换架构后需同步修改。
+默认使用新架构 (`u_model_switch=13`)。回退旧架构: 在 Config 中设 `u_model_switch=8`.
