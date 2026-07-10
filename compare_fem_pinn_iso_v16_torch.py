@@ -87,6 +87,7 @@ def load_pinn_and_predict(model_path, coords, cfg, params):
         R_range=params["R_lim"], theta_range=params["theta_lim"],
         core=cfg.core, kan_grid_size=cfg.kan_grid_size,
         kan_spline_order=cfg.kan_spline_order,
+        output_head_dim=cfg.output_head_dim,
     )
     model.load_weights(model_path)
     print(f"[PINN] Weights loaded from: {model_path}")

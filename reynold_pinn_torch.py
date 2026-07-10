@@ -66,9 +66,12 @@ class Config:
     device = "cuda"         # "cuda", "cpu", or "auto" (auto-select CUDA if available)
     batch_size = None       # minibatch size; None = full-batch, int = stochastic minibatch
 
+    output_dir = "output_torch1"
+
     # Model architecture
     core = "mlp"            # "mlp" (standard MLP) or "pikan" (KAN-based architecture)
-    layer_sizes = [2, 128, 128, 256, 256 , 256, 128 , 2]  # MLP layer sizes
+    layer_sizes = [2, 128, 128, 256, 256, 256, 128, 2]  # MLP layer sizes
+    output_head_dim = 64    # hidden dim inside deep output heads (P: 128→64→1, γ: 128→64→cat→64→1)
     # PIKAN params (only used when core == "pikan")
     kan_grid_size = 5       # B‑spline grid intervals
     kan_spline_order = 3    # B‑spline polynomial order
@@ -432,7 +435,7 @@ def main():
         use_device = cfg.device
 
     # Output directories
-    output_dir = os.path.join(SCRIPT_DIR, 'output_torch')
+    output_dir = os.path.join(SCRIPT_DIR, cfg.output_dir)
     log_dir = os.path.join(output_dir, 'log')
     ensure_dir(log_dir)
 
@@ -496,6 +499,7 @@ def main():
         core=cfg.core,
         kan_grid_size=cfg.kan_grid_size,
         kan_spline_order=cfg.kan_spline_order,
+        output_head_dim=cfg.output_head_dim,
     )
 
     # Print param‑count comparison

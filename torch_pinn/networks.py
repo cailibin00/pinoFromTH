@@ -184,25 +184,37 @@ class new_neural_period_polar_exactBC_two_output(nn.Module):
     """
     Main PINN architecture for Reynolds equation with JFO cavitation.
 
-    Architecture:
-    - Coslayer_normalization: Fourier feature encoding for periodic theta
-    - Dual-branch gating: tanh(gate * U + (1-gate) * V) per hidden layer
-    - Out_Imp_BC_layer: Learnable BC enforcement for both outputs
-    - Hermite interpolation: via x_1, x_2 branches
-    - Two output heads: P (pressure) and gamma (cavitation fraction)
-    - Both outputs via tanh^2 for non-negativity
-
-    This is the u_model_switch=8 architecture from the TF code.
+    Architecture (v2 — residuals + deep cross‑talk heads):
+    ┌─────────────────────────────────────────────────────┐
+    │  Coslayer_normalization (Fourier features)          │
+    │  ├─ U_base, V_base  (fixed reference features)      │
+    │  ├─ Hermite branches: x₁, x₂ → g_func₂              │
+    │  └─ Hidden layers with gating + RESIDUAL skips:     │
+    │       gate = tanh(Linear(C, w)(x_cos))              │
+    │       main  = gate·U_w + (1−gate)·V_w               │
+    │       x_out = main + skip_proj(x_prev)   ← residual │
+    ├─────────────────────────────────────────────────────┤
+    │  Deep Output Heads:                                 │
+    │    P:  x → FC(H)→tanh → [FC(H)→tanh + skip] → FC(1)│
+    │    γ:  x → FC(H)→tanh → [FC(H)→tanh + skip] →       │
+    │         concat(P_hid, γ_hid) →                       │
+    │         FC(H)→tanh → [FC(H)→tanh + skip] → FC(1)    │
+    │         ↑ fuses pressure information                 │
+    ├─────────────────────────────────────────────────────┤
+    │  BC enforcement + tanh² output (unchanged)           │
+    └─────────────────────────────────────────────────────┘
     """
 
-    def __init__(self, layer_sizes, bc_values, r_lim, theta_lim):
+    def __init__(self, layer_sizes, bc_values, r_lim, theta_lim,
+                 output_head_dim=64):
         """
         Args:
-            layer_sizes: [input_dim, hidden_0, ..., output_dim]
-                         e.g. [2, 128, 128, 128, 128, 2]
-            bc_values: [bc_lower, bc_upper] boundary pressure values
-            r_lim: [r_min, r_max]
-            theta_lim: [theta_min, theta_max]
+            layer_sizes: [in_dim, cos_units, hidden_0, ..., hidden_N, out_dim]
+                         e.g. [2, 128, 128, 256, 256, 256, 128, 2]
+            bc_values:   [bc_lower, bc_upper]
+            r_lim:       [r_min, r_max]
+            theta_lim:   [theta_min, theta_max]
+            output_head_dim: hidden dimension inside the deep output heads
         """
         super(new_neural_period_polar_exactBC_two_output, self).__init__()
 
@@ -210,42 +222,70 @@ class new_neural_period_polar_exactBC_two_output(nn.Module):
         self.theta_lim = theta_lim
         self.bc_values = bc_values
         self.layer_sizes = layer_sizes
+        self.head_dim = output_head_dim
 
-        # Coslayer_normalization: Fourier feature encoding
+        cos_units   = layer_sizes[1]          # Fourier-feature output width
+        hidden_w    = list(layer_sizes[2:-1]) # all hidden widths
+        base_width  = hidden_w[0]             # U / V baseline dimension
+        last_dim    = hidden_w[-1]            # last hidden → input to output heads
+
+        # ---- 1. Fourier feature encoding ----
         self.coslayer = Coslayer_normalization(
-            units=layer_sizes[1],
-            r_lim=r_lim,
-            theta_lim=theta_lim,
+            units=cos_units, r_lim=r_lim, theta_lim=theta_lim,
             activation=nn.Tanh()
         )
 
-        # Two feature branches (U and V) for gating
-        # x_U, x_V: Dense(layer_sizes[2], tanh)
-        hidden_width = layer_sizes[2]
-        self.x_U = nn.Linear(layer_sizes[1], hidden_width)
-        self.x_V = nn.Linear(layer_sizes[1], hidden_width)
+        # ---- 2. U / V base branches (at first hidden width) ----
+        self.x_U = nn.Linear(cos_units, base_width)
+        self.x_V = nn.Linear(cos_units, base_width)
 
-        # Extra branches for Hermite interpolation
-        # x_1, x_2: Dense(1, tanh)
-        self.x_1 = nn.Linear(layer_sizes[1], 1)
-        self.x_2 = nn.Linear(layer_sizes[1], 1)
+        # ---- 3. Hermite interpolation branches ----
+        self.x_1 = nn.Linear(cos_units, 1)
+        self.x_2 = nn.Linear(cos_units, 1)
 
-        # Hidden layers with gating
-        # For each width in layer_sizes[2:-1]:
-        #   x_t = Dense(width, tanh)
-        #   x = x_t * x_U + (1-x_t) * x_V
-        self.hidden_layers = nn.ModuleList()
-        self.gate_layers = nn.ModuleList()
-        self.hidden_widths = []
-        for width in layer_sizes[2:-1]:
-            self.gate_layers.append(nn.Linear(layer_sizes[1], width))
-            self.hidden_widths.append(width)
+        # ---- 4. Gate layers (one per hidden width) ----
+        self.gate_layers = nn.ModuleList([
+            nn.Linear(cos_units, w) for w in hidden_w
+        ])
+        self.hidden_widths = hidden_w
 
-        # Output heads
-        self.p_head = nn.Linear(layer_sizes[1], 1)
-        self.gamma_head = nn.Linear(layer_sizes[1], 1)
+        # ---- 5. U / V projection layers (only when w ≠ base_width) ----
+        self.U_proj = nn.ModuleDict()
+        self.V_proj = nn.ModuleDict()
+        for i, w in enumerate(hidden_w):
+            if w != base_width:
+                self.U_proj[str(i)] = nn.Linear(base_width, w)
+                self.V_proj[str(i)] = nn.Linear(base_width, w)
 
-        # Out_Imp_BC layers: learnable BC distance functions
+        # ---- 6. Skip projections for residual connections ----
+        self.skip_proj = nn.ModuleList()
+        for i in range(len(hidden_w) - 1):
+            w_prev = hidden_w[i]
+            w_next = hidden_w[i + 1]
+            if w_prev != w_next:
+                self.skip_proj.append(nn.Linear(w_prev, w_next))
+            else:
+                self.skip_proj.append(nn.Identity())
+
+        # ---- 7. Deep Output Heads ----
+        H = output_head_dim
+
+        # --- Pressure head: last_dim → H → (residual H→H) → 1 ---
+        self.p_fc1      = nn.Linear(last_dim, H)
+        self.p_fc2      = nn.Linear(H, H)          # residual block
+        self.p_fc_out   = nn.Linear(H, 1)
+
+        # --- Gamma head (stage 1): last_dim → H → (residual H→H) ---
+        self.g_fc1      = nn.Linear(last_dim, H)
+        self.g_fc2      = nn.Linear(H, H)          # residual block
+
+        # --- Gamma head (stage 2 — fuses pressure hidden state):
+        #     concat(P_hid, γ_hid) → H → (residual H→H) → 1 ---
+        self.g_cat_fc1  = nn.Linear(2 * H, H)
+        self.g_cat_fc2  = nn.Linear(H, H)          # residual block
+        self.g_fc_out   = nn.Linear(H, 1)
+
+        # ---- 8. BC distance functions ----
         self.bc_sigma_1 = Out_Imp_BC_layer(para_exp_BC_initializer=1.0)
         self.bc_sigma_2 = Out_Imp_BC_layer(para_exp_BC_initializer=1.0)
 
@@ -259,10 +299,10 @@ class new_neural_period_polar_exactBC_two_output(nn.Module):
                 if m.bias is not None:
                     init.zeros_(m.bias)
         # Special initializations matching TF
-        init.zeros_(self.p_head.bias)
-        init.zeros_(self.gamma_head.bias)
-        # gamma head kernel initialized to ~1e-6 (very small)
-        init.constant_(self.gamma_head.weight, 1e-6)
+        init.zeros_(self.p_fc_out.bias)
+        init.zeros_(self.g_fc_out.bias)
+        # Gamma output kernel initialized to ~1e-6 (very small)
+        init.constant_(self.g_fc_out.weight, 1e-6)
 
     @property
     def num_params(self):
@@ -285,36 +325,79 @@ class new_neural_period_polar_exactBC_two_output(nn.Module):
             lines.append(f"{name:<35s} {n:>10,d}")
         return "\n".join(lines)
 
+    # ------------------------------------------------------------------
+    # Forward pass
+    # ------------------------------------------------------------------
     def forward(self, inputs):
 
-        # Fourier feature encoding
-        x, inputs_R = self.coslayer(inputs)  # x: [N, layer_sizes[1]]
+        # ---- Fourier feature encoding ----
+        x, inputs_R = self.coslayer(inputs)       # x: [N, cos_units]
 
-        # Two feature branches
-        x_U = torch.tanh(self.x_U(x))  # [N, layer_sizes[2]]
-        x_V = torch.tanh(self.x_V(x))  # [N, layer_sizes[2]]
+        # ---- U / V base features ----
+        U_base = torch.tanh(self.x_U(x))           # [N, base_width]
+        V_base = torch.tanh(self.x_V(x))           # [N, base_width]
 
-        # Hermite interpolation branches
-        x_1 = torch.tanh(self.x_1(x))  # [N, 1]
-        x_2 = torch.tanh(self.x_2(x))  # [N, 1]
+        # ---- Hermite interpolation branches ----
+        x_1 = torch.tanh(self.x_1(x))              # [N, 1]
+        x_2 = torch.tanh(self.x_2(x))              # [N, 1]
 
-        # Hidden layers with gating mechanism
-        # x_t = tanh(Dense(width)(x_original)) — gate computed from coslayer output
-        # x = x_t * x_U + (1 - x_t) * x_V
-        for i, gate_layer in enumerate(self.gate_layers):
-            x_t = torch.tanh(gate_layer(x))  # gate from coslayer output
-            x = x_t * x_U + (1.0 - x_t) * x_V
+        # ---- Gated hidden layers with RESIDUAL connections ----
+        hidden_w   = self.hidden_widths
+        base_width = hidden_w[0]
+        prev = None
 
-        # Output heads
-        predictions = self.p_head(x)       # [N, 1] raw P
-        prediction_g = self.gamma_head(x)  # [N, 1] raw gamma
+        for i, (w, gate_layer) in enumerate(zip(hidden_w, self.gate_layers)):
+            # Gate signal from Fourier features
+            gate = torch.tanh(gate_layer(x))       # [N, w]
 
-        # BC enforcement: learnable distance functions
-        sigma_func_1 = self.bc_sigma_1(inputs_R)  # [N, 1]
-        sigma_func_2 = self.bc_sigma_2(inputs_R)  # [N, 1]
+            # U / V at current width
+            if w == base_width:
+                U_w, V_w = U_base, V_base
+            else:
+                U_w = torch.tanh(self.U_proj[str(i)](U_base))
+                V_w = torch.tanh(self.V_proj[str(i)](V_base))
 
-        # g_func_1: atanh-based interpolation of sqrt(bc_values)
-        # g_func = atanh((sqrt(bc[1]) - sqrt(bc[0]))/2 * (R+1) + sqrt(bc[0]))
+            # Gated blend
+            main = gate * U_w + (1.0 - gate) * V_w   # [N, w]
+
+            # Residual skip from previous layer
+            if prev is not None:
+                skip = self.skip_proj[i - 1](prev)   # identity or projection
+                main = main + skip
+
+            prev = main
+
+        # prev is now the last hidden state  [N, last_dim]
+        H = self.head_dim
+
+        # ================================================================
+        #  Deep Output Heads
+        # ================================================================
+
+        # --- Pressure head ---
+        #  last_dim → H  →  (H→H residual)  →  1
+        p_h1 = torch.tanh(self.p_fc1(prev))
+        p_h2 = torch.tanh(self.p_fc2(p_h1)) + p_h1        # residual
+        p_raw = self.p_fc_out(p_h2)                        # [N, 1]
+
+        # --- Gamma head (stage 1) ---
+        #  last_dim → H  →  (H→H residual)
+        g_h1 = torch.tanh(self.g_fc1(prev))
+        g_h2 = torch.tanh(self.g_fc2(g_h1)) + g_h1        # residual
+
+        # --- Gamma head (stage 2 — fuse pressure hidden state) ---
+        #  concat(p_h2, g_h2)  →  H  →  (H→H residual)  →  1
+        g_cat  = torch.cat([p_h2, g_h2], dim=1)            # [N, 2H]
+        g_cat1 = torch.tanh(self.g_cat_fc1(g_cat))
+        g_cat2 = torch.tanh(self.g_cat_fc2(g_cat1)) + g_cat1  # residual
+        g_raw  = self.g_fc_out(g_cat2)                     # [N, 1]
+
+        # ================================================================
+        #  BC enforcement (unchanged from original)
+        # ================================================================
+        sigma_func_1 = self.bc_sigma_1(inputs_R)           # [N, 1]
+        sigma_func_2 = self.bc_sigma_2(inputs_R)           # [N, 1]
+
         bc_0 = self.bc_values[0]
         bc_1 = self.bc_values[1]
         g_func_1 = torch.atanh(
@@ -324,7 +407,6 @@ class new_neural_period_polar_exactBC_two_output(nn.Module):
             torch.sqrt(torch.tensor(bc_0, dtype=torch.float32, device=inputs.device))
         )
 
-        # g_func_2: 2-point cubic Hermite interpolation
         g_func_2 = (
             x_1 * (inputs_R + 1.0) * ((inputs_R - 1.0) / (-2.0)) ** 2 +
             x_2 * (inputs_R - 1.0) * ((inputs_R + 1.0) / 2.0) ** 2
@@ -332,12 +414,11 @@ class new_neural_period_polar_exactBC_two_output(nn.Module):
 
         g_func = g_func_1 + g_func_2
 
-        # Apply BC enforcement and final activations
-        predictions = g_func + sigma_func_1 * predictions
-        prediction_g = sigma_func_2 * prediction_g
+        predictions   = g_func + sigma_func_1 * p_raw
+        prediction_g  = sigma_func_2 * g_raw
 
-        # Non-negative outputs via tanh^2
-        predictions = torch.tanh(predictions) ** 2
+        # Non-negative outputs via tanh²
+        predictions  = torch.tanh(predictions) ** 2
         prediction_g = torch.tanh(prediction_g) ** 2
 
         return [predictions, prediction_g]
@@ -491,16 +572,18 @@ class PIKAN_Polar_BC_Two_Output(nn.Module):
     """
 
     def __init__(self, layer_sizes, bc_values, r_lim, theta_lim,
-                 kan_grid_size=5, kan_spline_order=3):
+                 kan_grid_size=5, kan_spline_order=3, output_head_dim=64):
         """
         Args:
             layer_sizes: [input_dim, cos_units, hidden, ..., hidden, output_dim]
-                         e.g. [2, 46, 36, 36, 36, 2]
+                         All hidden widths MUST be equal (required by KAN gating).
+                         e.g. [2, 64, 64, 64, 64, 2]
             bc_values:   [bc_lower, bc_upper]
             r_lim:       [r_min, r_max]
             theta_lim:   [theta_min, theta_max]
             kan_grid_size:    G — number of B‑spline grid intervals
             kan_spline_order: K — polynomial order of B‑splines
+            output_head_dim:  hidden dim inside deep output heads
         """
         super(PIKAN_Polar_BC_Two_Output, self).__init__()
 
@@ -508,27 +591,30 @@ class PIKAN_Polar_BC_Two_Output(nn.Module):
         self.theta_lim = theta_lim
         self.bc_values = bc_values
         self.layer_sizes = layer_sizes
+        self.head_dim = output_head_dim
+        self.kan_grid_size = kan_grid_size
+        self.kan_spline_order = kan_spline_order
 
-        # ---- 1. Fourier feature encoding (same as MLP version) ----
+        cos_units = layer_sizes[1]
+        hidden_w  = list(layer_sizes[2:-1])
+        base_width = hidden_w[0]
+        last_dim   = hidden_w[-1]
+
+        # ---- 1. Fourier feature encoding ----
         self.coslayer = Coslayer_normalization(
-            units=layer_sizes[1],
-            r_lim=r_lim,
-            theta_lim=theta_lim,
+            units=cos_units, r_lim=r_lim, theta_lim=theta_lim,
             activation=nn.Tanh()
         )
 
-        cos_units = layer_sizes[1]
-        hid_width = layer_sizes[2]
-
-        # ---- 2. KAN branches for U / V feature representations ----
-        self.x_U = KANLinear(cos_units, hid_width,
+        # ---- 2. KAN U / V base branches (at first hidden width) ----
+        self.x_U = KANLinear(cos_units, base_width,
                              grid_size=kan_grid_size,
                              spline_order=kan_spline_order)
-        self.x_V = KANLinear(cos_units, hid_width,
+        self.x_V = KANLinear(cos_units, base_width,
                              grid_size=kan_grid_size,
                              spline_order=kan_spline_order)
 
-        # ---- 3. KAN branches for Hermite interpolation ----
+        # ---- 3. KAN Hermite interpolation branches ----
         self.x_1 = KANLinear(cos_units, 1,
                              grid_size=kan_grid_size,
                              spline_order=kan_spline_order)
@@ -536,22 +622,56 @@ class PIKAN_Polar_BC_Two_Output(nn.Module):
                              grid_size=kan_grid_size,
                              spline_order=kan_spline_order)
 
-        # ---- 4. Per‑layer gate modules (KAN, then tanh) ----
+        # ---- 4. KAN gate layers (one per hidden width) ----
         self.gate_layers = nn.ModuleList()
-        self.hidden_widths = []
-        for width in layer_sizes[2:-1]:
+        self.hidden_widths = hidden_w
+        for w in hidden_w:
             self.gate_layers.append(
-                KANLinear(cos_units, width,
+                KANLinear(cos_units, w,
                           grid_size=kan_grid_size,
                           spline_order=kan_spline_order)
             )
-            self.hidden_widths.append(width)
 
-        # ---- 5. Output heads (plain Linear — final projections) ----
-        self.p_head = nn.Linear(cos_units, 1)
-        self.gamma_head = nn.Linear(cos_units, 1)
+        # ---- 5. U / V projection layers (only when w ≠ base_width) ----
+        self.U_proj = nn.ModuleDict()
+        self.V_proj = nn.ModuleDict()
+        for i, w in enumerate(hidden_w):
+            if w != base_width:
+                self.U_proj[str(i)] = KANLinear(base_width, w,
+                                                grid_size=kan_grid_size,
+                                                spline_order=kan_spline_order)
+                self.V_proj[str(i)] = KANLinear(base_width, w,
+                                                grid_size=kan_grid_size,
+                                                spline_order=kan_spline_order)
 
-        # ---- 6. Learnable BC distance functions (same as MLP) ----
+        # ---- 6. Skip projections (Linear — cheap dim change) ----
+        self.skip_proj = nn.ModuleList()
+        for i in range(len(hidden_w) - 1):
+            w_prev = hidden_w[i]
+            w_next = hidden_w[i + 1]
+            if w_prev != w_next:
+                self.skip_proj.append(nn.Linear(w_prev, w_next))
+            else:
+                self.skip_proj.append(nn.Identity())
+
+        # ---- 7. Deep Output Heads (same as MLP v2) ----
+        H = output_head_dim
+
+        # Pressure head: last_dim → H → (residual H→H) → 1
+        self.p_fc1    = nn.Linear(last_dim, H)
+        self.p_fc2    = nn.Linear(H, H)
+        self.p_fc_out = nn.Linear(H, 1)
+
+        # Gamma head stage 1: last_dim → H → (residual H→H)
+        self.g_fc1    = nn.Linear(last_dim, H)
+        self.g_fc2    = nn.Linear(H, H)
+
+        # Gamma head stage 2 (fuses pressure hidden): 2H → H → (residual H→H) → 1
+        self.g_cat_fc1 = nn.Linear(2 * H, H)
+        self.g_cat_fc2 = nn.Linear(H, H)
+        self.g_fc_out  = nn.Linear(H, 1)
+
+        # ---- 8. BC distance functions ----
         self.bc_sigma_1 = Out_Imp_BC_layer(para_exp_BC_initializer=1.0)
         self.bc_sigma_2 = Out_Imp_BC_layer(para_exp_BC_initializer=1.0)
 
@@ -559,13 +679,13 @@ class PIKAN_Polar_BC_Two_Output(nn.Module):
 
     def _init_weights(self):
         """Initialize output heads matching the MLP convention."""
-        for m in [self.p_head, self.gamma_head]:
+        for m in [self.p_fc_out, self.g_fc_out]:
             init.xavier_normal_(m.weight)
             if m.bias is not None:
                 init.zeros_(m.bias)
-        init.zeros_(self.p_head.bias)
-        init.zeros_(self.gamma_head.bias)
-        init.constant_(self.gamma_head.weight, 1e-6)
+        init.zeros_(self.p_fc_out.bias)
+        init.zeros_(self.g_fc_out.bias)
+        init.constant_(self.g_fc_out.weight, 1e-6)
 
     @property
     def num_params(self):
@@ -600,28 +720,61 @@ class PIKAN_Polar_BC_Two_Output(nn.Module):
         # ---- Fourier feature encoding ----
         x, inputs_R = self.coslayer(inputs)  # x: [N, cos_units]
 
-        # ---- U / V feature branches (with tanh for gating range) ----
-        x_U = torch.tanh(self.x_U(x))  # [N, hid_width]
-        x_V = torch.tanh(self.x_V(x))  # [N, hid_width]
+        # ---- U / V base features ----
+        U_base = torch.tanh(self.x_U(x))  # [N, base_width]
+        V_base = torch.tanh(self.x_V(x))  # [N, base_width]
 
         # ---- Hermite interpolation branches ----
         x_1 = torch.tanh(self.x_1(x))  # [N, 1]
         x_2 = torch.tanh(self.x_2(x))  # [N, 1]
 
-        # ---- Gated hidden layers (same logic as MLP) ----
-        for gate_layer in self.gate_layers:
-            x_t = torch.tanh(gate_layer(x))       # gate from coslayer output
-            x = x_t * x_U + (1.0 - x_t) * x_V     # blend U / V
+        # ---- Gated hidden layers with RESIDUAL connections ----
+        hidden_w   = self.hidden_widths
+        base_width = hidden_w[0]
+        prev = None
 
-        # ---- Output heads ----
-        predictions   = self.p_head(x)       # [N, 1] raw P
-        prediction_g  = self.gamma_head(x)   # [N, 1] raw γ
+        for i, (w, gate_layer) in enumerate(zip(hidden_w, self.gate_layers)):
+            gate = torch.tanh(gate_layer(x))       # [N, w]
+
+            # U / V at current width
+            if w == base_width:
+                U_w, V_w = U_base, V_base
+            else:
+                U_w = torch.tanh(self.U_proj[str(i)](U_base))
+                V_w = torch.tanh(self.V_proj[str(i)](V_base))
+
+            main = gate * U_w + (1.0 - gate) * V_w   # [N, w]
+
+            # Residual skip
+            if prev is not None:
+                skip = self.skip_proj[i - 1](prev)
+                main = main + skip
+
+            prev = main
+
+        # ---- Deep Output Heads (same as MLP v2) ----
+        H = self.head_dim
+
+        # Pressure head
+        p_h1  = torch.tanh(self.p_fc1(prev))
+        p_h2  = torch.tanh(self.p_fc2(p_h1)) + p_h1
+        p_raw = self.p_fc_out(p_h2)
+
+        # Gamma head stage 1
+        g_h1 = torch.tanh(self.g_fc1(prev))
+        g_h2 = torch.tanh(self.g_fc2(g_h1)) + g_h1
+
+        # Gamma head stage 2 (fuse pressure info)
+        g_cat  = torch.cat([p_h2, g_h2], dim=1)
+        g_cat1 = torch.tanh(self.g_cat_fc1(g_cat))
+        g_cat2 = torch.tanh(self.g_cat_fc2(g_cat1)) + g_cat1
+        g_raw  = self.g_fc_out(g_cat2)
 
         # ---- BC distance functions ----
-        sigma_func_1 = self.bc_sigma_1(inputs_R)  # [N, 1]
-        sigma_func_2 = self.bc_sigma_2(inputs_R)  # [N, 1]
+        sigma_func_1 = self.bc_sigma_1(inputs_R)
+        sigma_func_2 = self.bc_sigma_2(inputs_R)
 
-        # ---- g_func: atanh interpolation of sqrt(bc) (same as MLP) ----
+        # ---- g_func ----
         bc0 = self.bc_values[0]
         bc1 = self.bc_values[1]
         g_func_1 = torch.atanh(
@@ -631,7 +784,6 @@ class PIKAN_Polar_BC_Two_Output(nn.Module):
             torch.sqrt(torch.tensor(bc0, dtype=torch.float32, device=inputs.device))
         )
 
-        # ---- g_func_2: Hermite interpolation ----
         g_func_2 = (
             x_1 * (inputs_R + 1.0) * ((inputs_R - 1.0) / (-2.0)) ** 2 +
             x_2 * (inputs_R - 1.0) * ((inputs_R + 1.0) / 2.0) ** 2
@@ -640,8 +792,8 @@ class PIKAN_Polar_BC_Two_Output(nn.Module):
         g_func = g_func_1 + g_func_2
 
         # ---- Apply BC enforcement ----
-        predictions  = g_func + sigma_func_1 * predictions
-        prediction_g = sigma_func_2 * prediction_g
+        predictions  = g_func + sigma_func_1 * p_raw
+        prediction_g = sigma_func_2 * g_raw
 
         # ---- Non‑negative outputs via tanh² ----
         predictions  = torch.tanh(predictions) ** 2

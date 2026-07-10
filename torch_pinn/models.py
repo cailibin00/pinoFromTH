@@ -126,7 +126,8 @@ class CollocationSolverND:
                 adapt_True=False, isAdaptive=False, MTL_adapt=False,
                 PCGrad_true=False, Boundary_true=True,
                 R_range=None, theta_range=None, batch_size=None,
-                core='mlp', kan_grid_size=5, kan_spline_order=3):
+                core='mlp', kan_grid_size=5, kan_spline_order=3,
+                output_head_dim=64):
         """
         Configure the solver.
 
@@ -136,6 +137,7 @@ class CollocationSolverND:
             core: 'mlp' (standard MLP) or 'pikan' (KAN-based architecture)
             kan_grid_size: B‑spline grid intervals (PIKAN only)
             kan_spline_order: B‑spline polynomial order (PIKAN only)
+            output_head_dim: hidden dim inside deep output heads
         """
         self.layer_sizes = layer_sizes
         self.bcs = bcs
@@ -158,10 +160,12 @@ class CollocationSolverND:
             bc_values = [bcs[0].val, bcs[1].val]
 
             if core == 'pikan':
-                # Auto‑compute PIKAN sizes if layer_sizes are the MLP defaults
-                # (if user passed the MLP [2,128,128,128,128,2], we auto‑tune)
-                mlp_default = [2, 128, 128, 128, 128, 2]
-                if layer_sizes == mlp_default:
+                # Auto‑compute PIKAN sizes if the user hasn't manually set them.
+                # We detect this by checking if layer_sizes look like MLP sizes
+                # (cos_units ≠ hidden_width, or >5 layers) → auto-tune.
+                hidden_w = layer_sizes[2:-1]
+                if len(set(hidden_w)) > 1 or len(hidden_w) > 4:
+                    # MLP-style sizes with varying widths → auto-compute
                     pikan_sizes = auto_pikan_layer_sizes(
                         layer_sizes, kan_grid_size, kan_spline_order
                     )
@@ -174,6 +178,7 @@ class CollocationSolverND:
                     pikan_sizes, bc_values, self.R_range, self.theta_range,
                     kan_grid_size=kan_grid_size,
                     kan_spline_order=kan_spline_order,
+                    output_head_dim=output_head_dim,
                 )
 
                 # Print parameter summary
@@ -186,7 +191,8 @@ class CollocationSolverND:
                     print(f"{'='*60}\n")
             else:
                 self.u_model = new_neural_period_polar_exactBC_two_output(
-                    layer_sizes, bc_values, self.R_range, self.theta_range
+                    layer_sizes, bc_values, self.R_range, self.theta_range,
+                    output_head_dim=output_head_dim,
                 )
 
                 trainable, total = count_model_params(self.u_model)
@@ -695,6 +701,7 @@ class CollocationSolverND:
             'core': getattr(self, 'core', 'mlp'),
             'kan_grid_size': getattr(self, 'kan_grid_size', 5),
             'kan_spline_order': getattr(self, 'kan_spline_order', 3),
+            'output_head_dim': getattr(self, 'output_head_dim', 64),
         }, save_path)
 
     def load_model(self, path, compile_model=False):
@@ -707,16 +714,19 @@ class CollocationSolverND:
         core = checkpoint.get('core', 'mlp')
         kan_grid_size = checkpoint.get('kan_grid_size', 5)
         kan_spline_order = checkpoint.get('kan_spline_order', 3)
+        output_head_dim = checkpoint.get('output_head_dim', 64)
 
         if core == 'pikan':
             self.u_model = PIKAN_Polar_BC_Two_Output(
                 self.layer_sizes, bc_values, self.R_range, self.theta_range,
                 kan_grid_size=kan_grid_size,
                 kan_spline_order=kan_spline_order,
+                output_head_dim=output_head_dim,
             )
         else:
             self.u_model = new_neural_period_polar_exactBC_two_output(
-                self.layer_sizes, bc_values, self.R_range, self.theta_range
+                self.layer_sizes, bc_values, self.R_range, self.theta_range,
+                output_head_dim=output_head_dim,
             )
         self.u_model.load_state_dict(checkpoint['model_state_dict'])
         self.u_model.to(self.device)
