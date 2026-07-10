@@ -1,38 +1,45 @@
-from .networks import FourierDecoupledPINN, SimpleMLPPINN
-from .solver import TorchCollocationSolver
+"""
+torch_pinn - PyTorch implementation of PINN for Reynolds equation with JFO cavitation.
+Faithful 1:1 port from tensordiffeq (TensorFlow).
+"""
+
+from .networks import (
+    Coslayer_normalization,
+    Out_Imp_BC_layer,
+    Out_Imp_BC_value_layer,
+    new_neural_period_polar_exactBC_two_output,
+)
+
+from .models import CollocationSolverND, ComputeSum_weight
+
 from .domains import DomainND
-from .boundaries import dirichletBC
-from .training import train_model_torch
+
+from .boundaries import (
+    BC,
+    dirichletBC,
+    FunctionDirichletBC,
+    FunctionNeumannBC,
+    IC,
+    periodicBC,
+)
+
 from .utils import (
     mse,
-    grad,
-    to_torch,
     find_L2_error,
-    piecewise_lr,
     latin_hypercube_sample,
     multimesh,
     flatten_and_stack,
-    ensure_dir,
+    set_weights_torch,
+    get_weights_torch,
+    get_sizes,
     Tee,
+    ensure_dir,
+    to_torch,
+    grad,
 )
+
 from .pcgrad import pcgrad
 
-__all__ = [
-    "FourierDecoupledPINN",
-    "SimpleMLPPINN",
-    "TorchCollocationSolver",
-    "DomainND",
-    "dirichletBC",
-    "train_model_torch",
-    "mse",
-    "grad",
-    "to_torch",
-    "find_L2_error",
-    "piecewise_lr",
-    "latin_hypercube_sample",
-    "multimesh",
-    "flatten_and_stack",
-    "ensure_dir",
-    "pcgrad",
-    "Tee",
-]
+from .optimizers import LBFGS_Trainer
+
+from .fit import fit as fit_model
