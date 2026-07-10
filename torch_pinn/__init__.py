@@ -8,6 +8,10 @@ from .networks import (
     Out_Imp_BC_layer,
     Out_Imp_BC_value_layer,
     new_neural_period_polar_exactBC_two_output,
+    KANLinear,
+    PIKAN_Polar_BC_Two_Output,
+    count_model_params,
+    auto_pikan_layer_sizes,
 )
 
 from .models import CollocationSolverND, ComputeSum_weight

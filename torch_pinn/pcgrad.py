@@ -40,7 +40,7 @@ def pcgrad(losses, params, adaptive_constant_func_PCGrad_loss=None, balance=Fals
     # Compute per-task gradients
     grad_all = []
     for loss in losses:
-        g = torch.autograd.grad(loss, params, retain_graph=True, create_graph=True)
+        g = torch.autograd.grad(loss, params, retain_graph=True, create_graph=True, allow_unused=True)
         # Replace None gradients with zeros
         g_clean = []
         for gi, p in zip(g, params):

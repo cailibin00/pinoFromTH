@@ -14,7 +14,12 @@ import os
 import numpy as np
 import torch
 import torch.nn as nn
-from .networks import new_neural_period_polar_exactBC_two_output
+from .networks import (
+    new_neural_period_polar_exactBC_two_output,
+    PIKAN_Polar_BC_Two_Output,
+    count_model_params,
+    auto_pikan_layer_sizes,
+)
 from .utils import mse, to_torch, latin_hypercube_sample
 from .pcgrad import pcgrad
 
@@ -120,13 +125,17 @@ class CollocationSolverND:
                 u_model_switch=1, two_output=False, none_zero=False,
                 adapt_True=False, isAdaptive=False, MTL_adapt=False,
                 PCGrad_true=False, Boundary_true=True,
-                R_range=None, theta_range=None, batch_size=None):
+                R_range=None, theta_range=None, batch_size=None,
+                core='mlp', kan_grid_size=5, kan_spline_order=3):
         """
         Configure the solver.
 
         Args:
             ...
             batch_size: minibatch size for collocation points; None = full-batch
+            core: 'mlp' (standard MLP) or 'pikan' (KAN-based architecture)
+            kan_grid_size: B‑spline grid intervals (PIKAN only)
+            kan_spline_order: B‑spline polynomial order (PIKAN only)
         """
         self.layer_sizes = layer_sizes
         self.bcs = bcs
@@ -139,17 +148,60 @@ class CollocationSolverND:
         self.MTL_adapt = MTL_adapt
         self.R_range = R_range if R_range else []
         self.theta_range = theta_range if theta_range else []
+        self.core = core
+        self.kan_grid_size = kan_grid_size
+        self.kan_spline_order = kan_spline_order
 
-        # Build model based on switch
+        # Build model based on switch AND core type
         self.u_model_switch = u_model_switch
         if u_model_switch == 8:
             bc_values = [bcs[0].val, bcs[1].val]
-            self.u_model = new_neural_period_polar_exactBC_two_output(
-                layer_sizes, bc_values, self.R_range, self.theta_range
-            )
+
+            if core == 'pikan':
+                # Auto‑compute PIKAN sizes if layer_sizes are the MLP defaults
+                # (if user passed the MLP [2,128,128,128,128,2], we auto‑tune)
+                mlp_default = [2, 128, 128, 128, 128, 2]
+                if layer_sizes == mlp_default:
+                    pikan_sizes = auto_pikan_layer_sizes(
+                        layer_sizes, kan_grid_size, kan_spline_order
+                    )
+                else:
+                    pikan_sizes = layer_sizes  # user provided explicit PIKAN sizes
+
+                self.layer_sizes = pikan_sizes  # store actual sizes used
+
+                self.u_model = PIKAN_Polar_BC_Two_Output(
+                    pikan_sizes, bc_values, self.R_range, self.theta_range,
+                    kan_grid_size=kan_grid_size,
+                    kan_spline_order=kan_spline_order,
+                )
+
+                # Print parameter summary
+                trainable, total = count_model_params(self.u_model)
+                if self.verbose:
+                    print(f"\n{'='*60}")
+                    print(f"PIKAN model created (G={kan_grid_size}, K={kan_spline_order})")
+                    print(f"Layer sizes: {pikan_sizes}")
+                    print(self.u_model.param_summary())
+                    print(f"{'='*60}\n")
+            else:
+                self.u_model = new_neural_period_polar_exactBC_two_output(
+                    layer_sizes, bc_values, self.R_range, self.theta_range
+                )
+
+                trainable, total = count_model_params(self.u_model)
+                if self.verbose:
+                    print(f"\n{'='*60}")
+                    print(f"MLP model created")
+                    print(f"Layer sizes: {layer_sizes}")
+                    print(self.u_model.param_summary())
+                    print(f"{'='*60}\n")
         else:
             raise ValueError(f"Unsupported u_model_switch={u_model_switch}")
         self.u_model.to(self.device)
+
+        # Store param counts for later reference
+        self.model_param_count = trainable
 
         # Store PDE residual functions
         self.f_model_list = f_model_list
@@ -640,6 +692,9 @@ class CollocationSolverND:
             'R_range': self.R_range,
             'theta_range': self.theta_range,
             'bc_values': [self.bcs[0].val, self.bcs[1].val],
+            'core': getattr(self, 'core', 'mlp'),
+            'kan_grid_size': getattr(self, 'kan_grid_size', 5),
+            'kan_spline_order': getattr(self, 'kan_spline_order', 3),
         }, save_path)
 
     def load_model(self, path, compile_model=False):
@@ -649,8 +704,20 @@ class CollocationSolverND:
         self.R_range = checkpoint['R_range']
         self.theta_range = checkpoint['theta_range']
         bc_values = checkpoint['bc_values']
-        self.u_model = new_neural_period_polar_exactBC_two_output(
-            self.layer_sizes, bc_values, self.R_range, self.theta_range
-        )
+        core = checkpoint.get('core', 'mlp')
+        kan_grid_size = checkpoint.get('kan_grid_size', 5)
+        kan_spline_order = checkpoint.get('kan_spline_order', 3)
+
+        if core == 'pikan':
+            self.u_model = PIKAN_Polar_BC_Two_Output(
+                self.layer_sizes, bc_values, self.R_range, self.theta_range,
+                kan_grid_size=kan_grid_size,
+                kan_spline_order=kan_spline_order,
+            )
+        else:
+            self.u_model = new_neural_period_polar_exactBC_two_output(
+                self.layer_sizes, bc_values, self.R_range, self.theta_range
+            )
         self.u_model.load_state_dict(checkpoint['model_state_dict'])
         self.u_model.to(self.device)
+        self.core = core

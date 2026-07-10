@@ -97,11 +97,18 @@ def load_pinn_and_predict(model_path, coords, cfg, params):
     upper_bc = dirichletBC(Domain, val=params["P_o"], var="R", target="upper")
 
     model = CollocationSolverND()
+    # Resolve PIKAN layer sizes
+    if cfg.core == 'pikan' and cfg.pikan_layer_sizes is not None:
+        effective_sizes = cfg.pikan_layer_sizes
+    else:
+        effective_sizes = cfg.layer_sizes
     model.compile(
-        cfg.layer_sizes, [f_model_FBNS], Domain, [lower_bc, upper_bc],
+        effective_sizes, [f_model_FBNS], Domain, [lower_bc, upper_bc],
         u_model_switch=8, two_output=True, none_zero=False, adapt_True=False,
         isAdaptive=False, MTL_adapt=False, PCGrad_true=True, Boundary_true=False,
-        R_range=params["R_lim"], theta_range=params["theta_lim"]
+        R_range=params["R_lim"], theta_range=params["theta_lim"],
+        core=cfg.core, kan_grid_size=cfg.kan_grid_size,
+        kan_spline_order=cfg.kan_spline_order,
     )
 
     # Load weights

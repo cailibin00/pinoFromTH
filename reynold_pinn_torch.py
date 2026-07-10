@@ -22,6 +22,7 @@ from matplotlib import cm
 from torch_pinn.boundaries import dirichletBC
 from torch_pinn.domains import DomainND
 from torch_pinn.models import CollocationSolverND
+from torch_pinn.networks import new_neural_period_polar_exactBC_two_output, count_model_params
 from torch_pinn.utils import Tee, ensure_dir
 
 
@@ -57,7 +58,6 @@ class Config:
     domain_fidelity = 50    # domain mesh density
 
     # Training parameters
-    layer_sizes = [2, 128, 128, 128, 128, 2]
     N_train = 5000          # training iterations per stage
     NL_train = 4            # RAD refinement rounds
     ratio_RAD_list = [0.03, 0.01]  # RAD sampling ratios
@@ -65,6 +65,14 @@ class Config:
     # Hardware / batch
     device = "cuda"         # "cuda", "cpu", or "auto" (auto-select CUDA if available)
     batch_size = None       # minibatch size; None = full-batch, int = stochastic minibatch
+
+    # Model architecture
+    core = "mlp"            # "mlp" (standard MLP) or "pikan" (KAN-based architecture)
+    layer_sizes = [2, 128, 128, 256, 256 , 256, 128 , 2]  # MLP layer sizes
+    # PIKAN params (only used when core == "pikan")
+    kan_grid_size = 5       # B‑spline grid intervals
+    kan_spline_order = 3    # B‑spline polynomial order
+    pikan_layer_sizes = [2, 64, 64, 64, 64, 2]  # None = auto‑compute to match MLP param count; or specify manually
 
     # Plotting
     dpi_save = 600
@@ -439,6 +447,8 @@ def main():
     print("=" * 60)
     print(f"Device: {use_device}  (CUDA available: {torch.cuda.is_available()})")
     print(f"Batch size: {cfg.batch_size if cfg.batch_size else 'full-batch'}")
+    print(f"Core: {cfg.core}")
+    print(f"Layer sizes: {cfg.layer_sizes}")
 
     # Compute physical parameters
     params = compute_physical_params(cfg)
@@ -470,13 +480,33 @@ def main():
 
     # Create and compile model
     model = CollocationSolverND(device=use_device)
+
+    # Resolve PIKAN layer sizes: auto‑compute if None
+    if cfg.core == 'pikan' and cfg.pikan_layer_sizes is not None:
+        effective_layer_sizes = cfg.pikan_layer_sizes
+    else:
+        effective_layer_sizes = cfg.layer_sizes
+
     model.compile(
-        cfg.layer_sizes, [f_model_FBNS], Domain, BCs,
+        effective_layer_sizes, [f_model_FBNS], Domain, BCs,
         u_model_switch=8, two_output=True, none_zero=False, adapt_True=False,
         isAdaptive=False, MTL_adapt=False, PCGrad_true=True, Boundary_true=False,
         R_range=params['R_lim'], theta_range=params['theta_lim'],
-        batch_size=cfg.batch_size
+        batch_size=cfg.batch_size,
+        core=cfg.core,
+        kan_grid_size=cfg.kan_grid_size,
+        kan_spline_order=cfg.kan_spline_order,
     )
+
+    # Print param‑count comparison
+    mlp_dummy = new_neural_period_polar_exactBC_two_output(
+        cfg.layer_sizes, [params['P_i'], params['P_o']],
+        params['R_lim'], params['theta_lim']
+    )
+    mlp_params, _ = count_model_params(mlp_dummy)
+    pikan_params = sum(p.numel() for p in model.u_model.parameters() if p.requires_grad)
+    print(f"Param count — MLP: {mlp_params:,}  |  PIKAN: {pikan_params:,}" +
+          (f"  (delta: {pikan_params - mlp_params:+,})" if cfg.core == 'pikan' else ""))
 
     # Set save paths
     model.best_weights_path = os.path.join(output_dir, 'checkpoints', 'epochs_best_model.pt')
