@@ -22,15 +22,17 @@ import torch.nn.functional as F
 # =============================================================================
 class Coslayer_normalization(nn.Module):
     """
-    Fourier feature encoding layer with trainable frequencies and phases.
+    Separate R / θ encoding with independent MLP pathways before fusion.
 
-    Architecture:
-    1. Normalize R and theta to [-1, 1]
-    2. Compute cos(pi * theta_norm + phi) as Fourier features
-    3. Combine with R_norm via learned weights
-    4. Apply bias and tanh activation
+    Architecture (v2):
+    1. Normalize R and θ to [-1, 1]
+    2. θ pathway:  cos(π·θ_norm + φ)  →  MLP_θ  →  θ_features   [N, half]
+    3. R pathway:  R_norm              →  MLP_R  →  R_features   [N, half]
+    4. Concat(θ_features, R_features)  →  activation  →  x       [N, units]
 
-    This encodes periodic boundary conditions directly into the layer.
+    The old design merged R via a single scalar coefficient per channel
+    (kernel[0,i] × R_norm).  Now R gets its own two‑layer MLP, giving
+    both coordinates rich independent representations before fusion.
     """
 
     def __init__(self, units, r_lim, theta_lim, activation=nn.Tanh()):
@@ -39,60 +41,67 @@ class Coslayer_normalization(nn.Module):
         self.r_lim = r_lim
         self.theta_lim = theta_lim
 
-        # Trainable weights
-        # kernel: [2, units] - combines R_norm and cos features
-        self.kernel = nn.Parameter(torch.empty(2, units))
-        # phy: [units] - phase shift for each Fourier feature
-        self.phy = nn.Parameter(torch.empty(units))
-        # K: scalar = pi (constant, not trained)
-        self.register_buffer('K', torch.tensor(np.pi, dtype=torch.float32))
+        half = units // 2
 
-        self.use_bias = True
-        self.bias = nn.Parameter(torch.empty(units))
+        # ---- θ pathway ----
+        # Fourier encoding with trainable phases
+        self.phy = nn.Parameter(torch.empty(units))
+        self.register_buffer('K', torch.tensor(np.pi, dtype=torch.float32))
+        # θ MLP:  fourier(units) → SiLU → hidden(units) → SiLU → θ_features(half)
+        self.theta_fc1 = nn.Linear(units, units)
+        self.theta_fc2 = nn.Linear(units, half)
+
+        # ---- R pathway ----
+        # R MLP:  R_norm(1) → SiLU → hidden(units) → SiLU → R_features(half)
+        self.r_fc1 = nn.Linear(1, units)
+        self.r_fc2 = nn.Linear(units, half)
+
         self.activation = activation
 
         self.reset_parameters()
 
     def reset_parameters(self):
-        init.xavier_uniform_(self.kernel)
+        # θ pathway
         init.xavier_uniform_(self.phy.unsqueeze(0))
-        init.zeros_(self.bias)
+        init.xavier_uniform_(self.theta_fc1.weight)
+        init.zeros_(self.theta_fc1.bias)
+        init.xavier_uniform_(self.theta_fc2.weight)
+        init.zeros_(self.theta_fc2.bias)
+
+        # R pathway
+        init.xavier_uniform_(self.r_fc1.weight)
+        init.zeros_(self.r_fc1.bias)
+        init.xavier_uniform_(self.r_fc2.weight)
+        init.zeros_(self.r_fc2.bias)
 
     def forward(self, inputs):
         """
         Args:
             inputs: [N, 2] tensor with columns [R, theta]
         Returns:
-            outputs: [N, units] Fourier features
-            inputs_R: [N, 1] normalized R coordinate
+            outputs:  [N, units]  fused R/θ features
+            inputs_R: [N, 1]      normalized R (for BC sigma functions)
         """
-        # Extract R and theta columns
-        inputs_r = inputs[:, 0:1]     # [N, 1]
-        inputs_theta = inputs[:, 1:2]  # [N, 1]
+        # ---- Normalize both coordinates to [-1, 1] ----
+        inputs_r = inputs[:, 0:1]
+        inputs_theta = inputs[:, 1:2]
 
-        # Normalize to [-1, 1]
         inputs_R = 2.0 * (inputs_r - self.r_lim[0]) / (self.r_lim[1] - self.r_lim[0]) - 1.0
         inputs_Theta = 2.0 * (inputs_theta - self.theta_lim[0]) / (self.theta_lim[1] - self.theta_lim[0]) - 1.0
 
-        # Fourier features: cos(pi * theta_norm + phi)
-        # inputs_Theta: [N, 1], K: scalar, phy: [units]
-        # -> [N, units]
-        outputs = inputs_Theta * self.K  # [N, 1]
-        outputs = outputs + self.phy.unsqueeze(0)  # [N, units]
-        outputs = torch.cos(outputs)  # [N, units]
+        # ---- θ pathway: Fourier features → MLP ----
+        # cos(π·θ_norm + φ)  →  FC → SiLU  →  FC → SiLU
+        theta_fourier = torch.cos(inputs_Theta * self.K + self.phy.unsqueeze(0))  # [N, units]
+        theta_feat = F.silu(self.theta_fc1(theta_fourier))                         # [N, units]
+        theta_feat = F.silu(self.theta_fc2(theta_feat))                            # [N, half]
 
-        # Combine: kernel[0,:] * R_norm + kernel[1,:] * cos_features
-        # kernel: [2, units]
-        outputs_2 = outputs * self.kernel[1:2, :]  # [N, units] * [1, units]
+        # ---- R pathway: raw coordinate → MLP ----
+        # R_norm  →  FC → SiLU  →  FC → SiLU
+        r_feat = F.silu(self.r_fc1(inputs_R))                                      # [N, units]
+        r_feat = F.silu(self.r_fc2(r_feat))                                        # [N, half]
 
-        # Broadcast R_norm to [N, units] by adding zero
-        inputs_r_broadcast = inputs_R + 0.0 * self.phy.unsqueeze(0)  # [N, units]
-        outputs_1 = inputs_r_broadcast * self.kernel[0:1, :]  # [N, units]
-
-        outputs = outputs_1 + outputs_2
-
-        if self.use_bias:
-            outputs = outputs + self.bias.unsqueeze(0)
+        # ---- Merge independent pathways ----
+        outputs = torch.cat([theta_feat, r_feat], dim=1)                           # [N, units]
 
         if self.activation is not None:
             outputs = self.activation(outputs)
@@ -244,8 +253,12 @@ class new_neural_period_polar_exactBC_two_output(nn.Module):
         self.x_2 = nn.Linear(cos_units, 1)
 
         # ---- 4. Gate layers (one per hidden width) ----
+        # Gate inputs: first gate from coslayer, subsequent gates from
+        # the EVOLVING hidden state (matching TF: each gate reads the
+        # output of the previous gated blend, not the raw coslayer).
+        gate_inputs = [cos_units] + hidden_w[:-1]
         self.gate_layers = nn.ModuleList([
-            nn.Linear(cos_units, w) for w in hidden_w
+            nn.Linear(gate_inputs[i], hidden_w[i]) for i in range(len(hidden_w))
         ])
         self.hidden_widths = hidden_w
 
@@ -334,12 +347,12 @@ class new_neural_period_polar_exactBC_two_output(nn.Module):
         x, inputs_R = self.coslayer(inputs)       # x: [N, cos_units]
 
         # ---- U / V base features ----
-        U_base = torch.tanh(self.x_U(x))           # [N, base_width]
-        V_base = torch.tanh(self.x_V(x))           # [N, base_width]
+        U_base = F.silu(self.x_U(x))               # [N, base_width]
+        V_base = F.silu(self.x_V(x))               # [N, base_width]
 
         # ---- Hermite interpolation branches ----
-        x_1 = torch.tanh(self.x_1(x))              # [N, 1]
-        x_2 = torch.tanh(self.x_2(x))              # [N, 1]
+        x_1 = torch.tanh(self.x_1(x))              # [N, 1]  — keep tanh: Hermite bounded
+        x_2 = torch.tanh(self.x_2(x))              # [N, 1]  — keep tanh: Hermite bounded
 
         # ---- Gated hidden layers with RESIDUAL connections ----
         hidden_w   = self.hidden_widths
@@ -347,15 +360,17 @@ class new_neural_period_polar_exactBC_two_output(nn.Module):
         prev = None
 
         for i, (w, gate_layer) in enumerate(zip(hidden_w, self.gate_layers)):
-            # Gate signal from Fourier features
-            gate = torch.tanh(gate_layer(x))       # [N, w]
+            # Gate signal from previous layer (or coslayer for first layer)
+            # Matching TF: deeper gates see hierarchical features, not raw coslayer
+            gate_input = x if prev is None else prev
+            gate = torch.tanh(gate_layer(gate_input))       # [N, w]
 
             # U / V at current width
             if w == base_width:
                 U_w, V_w = U_base, V_base
             else:
-                U_w = torch.tanh(self.U_proj[str(i)](U_base))
-                V_w = torch.tanh(self.V_proj[str(i)](V_base))
+                U_w = F.silu(self.U_proj[str(i)](U_base))
+                V_w = F.silu(self.V_proj[str(i)](V_base))
 
             # Gated blend
             main = gate * U_w + (1.0 - gate) * V_w   # [N, w]
@@ -376,20 +391,20 @@ class new_neural_period_polar_exactBC_two_output(nn.Module):
 
         # --- Pressure head ---
         #  last_dim → H  →  (H→H residual)  →  1
-        p_h1 = torch.tanh(self.p_fc1(prev))
-        p_h2 = torch.tanh(self.p_fc2(p_h1)) + p_h1        # residual
+        p_h1 = F.silu(self.p_fc1(prev))
+        p_h2 = F.silu(self.p_fc2(p_h1)) + p_h1        # residual
         p_raw = self.p_fc_out(p_h2)                        # [N, 1]
 
         # --- Gamma head (stage 1) ---
         #  last_dim → H  →  (H→H residual)
-        g_h1 = torch.tanh(self.g_fc1(prev))
-        g_h2 = torch.tanh(self.g_fc2(g_h1)) + g_h1        # residual
+        g_h1 = F.silu(self.g_fc1(prev))
+        g_h2 = F.silu(self.g_fc2(g_h1)) + g_h1        # residual
 
         # --- Gamma head (stage 2 — fuse pressure hidden state) ---
         #  concat(p_h2, g_h2)  →  H  →  (H→H residual)  →  1
         g_cat  = torch.cat([p_h2, g_h2], dim=1)            # [N, 2H]
-        g_cat1 = torch.tanh(self.g_cat_fc1(g_cat))
-        g_cat2 = torch.tanh(self.g_cat_fc2(g_cat1)) + g_cat1  # residual
+        g_cat1 = F.silu(self.g_cat_fc1(g_cat))
+        g_cat2 = F.silu(self.g_cat_fc2(g_cat1)) + g_cat1  # residual
         g_raw  = self.g_fc_out(g_cat2)                     # [N, 1]
 
         # ================================================================
@@ -623,11 +638,14 @@ class PIKAN_Polar_BC_Two_Output(nn.Module):
                              spline_order=kan_spline_order)
 
         # ---- 4. KAN gate layers (one per hidden width) ----
+        # Gate inputs: first gate from coslayer, subsequent gates from
+        # the EVOLVING hidden state (matching TF).
+        gate_inputs = [cos_units] + hidden_w[:-1]
         self.gate_layers = nn.ModuleList()
         self.hidden_widths = hidden_w
-        for w in hidden_w:
+        for i, w in enumerate(hidden_w):
             self.gate_layers.append(
-                KANLinear(cos_units, w,
+                KANLinear(gate_inputs[i], w,
                           grid_size=kan_grid_size,
                           spline_order=kan_spline_order)
             )
@@ -721,8 +739,8 @@ class PIKAN_Polar_BC_Two_Output(nn.Module):
         x, inputs_R = self.coslayer(inputs)  # x: [N, cos_units]
 
         # ---- U / V base features ----
-        U_base = torch.tanh(self.x_U(x))  # [N, base_width]
-        V_base = torch.tanh(self.x_V(x))  # [N, base_width]
+        U_base = F.silu(self.x_U(x))  # [N, base_width]
+        V_base = F.silu(self.x_V(x))  # [N, base_width]
 
         # ---- Hermite interpolation branches ----
         x_1 = torch.tanh(self.x_1(x))  # [N, 1]
@@ -734,14 +752,16 @@ class PIKAN_Polar_BC_Two_Output(nn.Module):
         prev = None
 
         for i, (w, gate_layer) in enumerate(zip(hidden_w, self.gate_layers)):
-            gate = torch.tanh(gate_layer(x))       # [N, w]
+            # Gate signal from previous layer (or coslayer for first layer)
+            gate_input = x if prev is None else prev
+            gate = torch.tanh(gate_layer(gate_input))       # [N, w]
 
             # U / V at current width
             if w == base_width:
                 U_w, V_w = U_base, V_base
             else:
-                U_w = torch.tanh(self.U_proj[str(i)](U_base))
-                V_w = torch.tanh(self.V_proj[str(i)](V_base))
+                U_w = F.silu(self.U_proj[str(i)](U_base))
+                V_w = F.silu(self.V_proj[str(i)](V_base))
 
             main = gate * U_w + (1.0 - gate) * V_w   # [N, w]
 
@@ -756,18 +776,18 @@ class PIKAN_Polar_BC_Two_Output(nn.Module):
         H = self.head_dim
 
         # Pressure head
-        p_h1  = torch.tanh(self.p_fc1(prev))
-        p_h2  = torch.tanh(self.p_fc2(p_h1)) + p_h1
+        p_h1  = F.silu(self.p_fc1(prev))
+        p_h2  = F.silu(self.p_fc2(p_h1)) + p_h1
         p_raw = self.p_fc_out(p_h2)
 
         # Gamma head stage 1
-        g_h1 = torch.tanh(self.g_fc1(prev))
-        g_h2 = torch.tanh(self.g_fc2(g_h1)) + g_h1
+        g_h1 = F.silu(self.g_fc1(prev))
+        g_h2 = F.silu(self.g_fc2(g_h1)) + g_h1
 
         # Gamma head stage 2 (fuse pressure info)
         g_cat  = torch.cat([p_h2, g_h2], dim=1)
-        g_cat1 = torch.tanh(self.g_cat_fc1(g_cat))
-        g_cat2 = torch.tanh(self.g_cat_fc2(g_cat1)) + g_cat1
+        g_cat1 = F.silu(self.g_cat_fc1(g_cat))
+        g_cat2 = F.silu(self.g_cat_fc2(g_cat1)) + g_cat1
         g_raw  = self.g_fc_out(g_cat2)
 
         # ---- BC distance functions ----
