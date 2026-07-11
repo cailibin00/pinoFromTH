@@ -82,8 +82,7 @@ def load_pinn_and_predict(model_path, coords, cfg, params):
         effective_sizes = cfg.layer_sizes
     model.compile(
         effective_sizes, [f_model_FBNS], Domain, [lower_bc, upper_bc],
-        u_model_switch=8, two_output=True, none_zero=False, adapt_True=False,
-        isAdaptive=False, MTL_adapt=False, PCGrad_true=True, Boundary_true=False,
+        u_model_switch=8, two_output=True, none_zero=False,
         R_range=params["R_lim"], theta_range=params["theta_lim"],
         core=cfg.core, kan_grid_size=cfg.kan_grid_size,
         kan_spline_order=cfg.kan_spline_order,

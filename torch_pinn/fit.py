@@ -1,10 +1,10 @@
 """
 Training loop for PINN solver.
-Faithful port from tensordiffeq/fit.py (TensorFlow).
-
-Implements two-phase training:
-1. Adam phase with PCGrad + adaptive weighting
-2. L-BFGS phase for fine-tuning (optional)
+Simplified from the TF version:
+- Removed PCGrad (projecting conflicting gradients)
+- Removed adaptive loss weighting (ComputeSum_weight)
+- Replaced piecewise LR with CosineAnnealingLR scheduler
+- Two-phase training: Adam + L-BFGS (optional)
 """
 
 import time
@@ -13,15 +13,16 @@ import torch
 from tqdm.auto import trange
 
 
-def fit(obj, tf_iter=0, newton_iter=0, newton_eager=True):
+def fit(obj, tf_iter=0, newton_iter=0, newton_eager=True, scheduler=None):
     """
-    Main training loop (matching TF's fit function).
+    Main training loop.
 
     Args:
         obj: CollocationSolverND instance
         tf_iter: number of Adam iterations
         newton_iter: number of L-BFGS iterations (0 to skip)
         newton_eager: whether to use eager L-BFGS
+        scheduler: optional torch LR scheduler (stepped each epoch after optimizer.step)
     """
     start_time = time.time()
     epoch_base = obj.epoch_history[-1]
@@ -36,6 +37,10 @@ def fit(obj, tf_iter=0, newton_iter=0, newton_eager=True):
             for epoch in t:
                 # Training step
                 loss_value, loss_all = obj.train_step()
+
+                # Step the scheduler after optimizer update
+                if scheduler is not None:
+                    scheduler.step()
 
                 # Update epoch counter
                 current_epoch = epoch + epoch_base + 1
@@ -54,20 +59,10 @@ def fit(obj, tf_iter=0, newton_iter=0, newton_eager=True):
                             f'{name}={loss_all[i].item():.3e}'
                             for i, name in enumerate(loss_names) if i < len(loss_all)
                         ])
-                        print(f'  Epoch {current_epoch}: Total={loss_value.item():.3e} | {loss_str}')
+                        current_lr = obj.tf_optimizer.param_groups[0]['lr']
+                        print(f'  Epoch {current_epoch}: Total={loss_value.item():.3e} | {loss_str} | lr={current_lr:.2e}')
 
                     t.set_postfix(loss=loss_value.item())
-
-                    # Track adaptive weights
-                    obj.adaptive_constant_func_list.append(
-                        obj.adaptive_constant_func.adaptive_constant.numpy().copy()
-                    )
-
-                    # MTL_adapt tracking
-                    if obj.MTL_adapt:
-                        obj.MTL_adapt_list.append(
-                            obj.MTL_adapt_par.detach().cpu().numpy().copy()
-                        )
 
                 # Save best model every 100 epochs
                 if epoch % 100 == 0:

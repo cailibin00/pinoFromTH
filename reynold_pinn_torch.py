@@ -17,6 +17,7 @@ import numpy as np
 import torch
 import matplotlib.pyplot as plt
 from matplotlib import cm
+from torch.optim.lr_scheduler import CosineAnnealingLR
 
 # Torch PINN imports
 from torch_pinn.boundaries import dirichletBC
@@ -297,30 +298,34 @@ def generate_groove_points(theta_sym, params, cfg):
 def train_model(model, cfg, N_f_true):
     """
     Multi-stage training workflow.
-    Matching TF train_model exactly: 4 stages with piecewise LR + RAD refinement.
+    4 stages with CosineAnnealingLR scheduler + RAD refinement.
     """
-    # Learning rate schedules (matching TF)
-    lr_schedules = [
-        {'boundaries': [20000, 40000], 'values': [1e-3, 1e-4, 1e-5]},
-        {'boundaries': [20000, 40000], 'values': [1e-4, 1e-4, 1e-5]},
-        {'boundaries': [20000, 40000], 'values': [1e-5, 1e-4, 1e-5]},
-        {'boundaries': [20000, 40000], 'values': [1e-5, 1e-5, 1e-6]},
-    ]
+    # Initial learning rates per stage (progressively decreasing)
+    init_lrs = [1e-3, 1e-4, 1e-5, 1e-5]
+    eta_min = 1e-6
 
-    for schedule in lr_schedules:
-        # Update learning rate for this stage
-        current_lr = schedule['values'][0]
-        for param_group in model.tf_optimizer.param_groups:
-            param_group['lr'] = current_lr
-
-        # Store boundaries for piecewise LR
-        model._lr_boundaries = schedule['boundaries']
-        model._lr_values = schedule['values']
-        model._lr_stage_epoch = 0
+    for stage, init_lr in enumerate(init_lrs):
+        print(f"\n{'='*60}")
+        print(f"Stage {stage + 1}/4: init_lr={init_lr:.1e}, eta_min={eta_min:.1e}")
+        print(f"{'='*60}")
 
         for i_round in range(cfg.NL_train):
+            # Set initial LR for this round
+            for param_group in model.tf_optimizer.param_groups:
+                param_group['lr'] = init_lr
+
+            # Cosine annealing scheduler: decay from init_lr → eta_min over this round
+            scheduler = CosineAnnealingLR(
+                model.tf_optimizer,
+                T_max=cfg.N_train,
+                eta_min=eta_min
+            )
+
+            print(f"  Round {i_round + 1}/{cfg.NL_train}: "
+                  f"lr {init_lr:.1e} → {eta_min:.1e} (cosine)")
+
             # Run Adam training for this round
-            model.fit(tf_iter=cfg.N_train, newton_iter=0)
+            model.fit(tf_iter=cfg.N_train, newton_iter=0, scheduler=scheduler)
 
             # RAD refinement after each round
             if model.f_model_FB is not None:
@@ -492,8 +497,7 @@ def main():
 
     model.compile(
         effective_layer_sizes, [f_model_FBNS], Domain, BCs,
-        u_model_switch=8, two_output=True, none_zero=False, adapt_True=False,
-        isAdaptive=False, MTL_adapt=False, PCGrad_true=True, Boundary_true=False,
+        u_model_switch=8, two_output=True, none_zero=False,
         R_range=params['R_lim'], theta_range=params['theta_lim'],
         batch_size=cfg.batch_size,
         core=cfg.core,

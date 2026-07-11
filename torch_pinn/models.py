@@ -13,7 +13,6 @@ This is the heart of the PINN framework:
 import os
 import numpy as np
 import torch
-import torch.nn as nn
 from .networks import (
     new_neural_period_polar_exactBC_two_output,
     PIKAN_Polar_BC_Two_Output,
@@ -21,56 +20,6 @@ from .networks import (
     auto_pikan_layer_sizes,
 )
 from .utils import mse, to_torch, latin_hypercube_sample
-from .pcgrad import pcgrad
-
-
-# =============================================================================
-# ComputeSum_weight - Adaptive Loss Weighting
-# =============================================================================
-class ComputeSum_weight:
-    """
-    Adaptive loss weighting via exponential smoothing of gradient ratios.
-
-    Implements the TF ComputeSum_weight layer:
-    - w_new = (1 - alpha) * w_old + alpha * grad_ratio
-    - Tracks both instantaneous weights and step-averaged weights
-    """
-
-    def __init__(self, input_dim, adaptive_constant_alpha, adaptive_constant_step_alpha=100):
-        self.input_dim = input_dim
-        self.alpha = adaptive_constant_alpha
-        self.step_alpha = adaptive_constant_step_alpha
-        # adaptive_constant: exponentially smoothed weights
-        self.adaptive_constant = torch.ones(1, input_dim)
-        # adaptive_constant_step: step-averaged reference
-        self.adaptive_constant_step = torch.ones(1, input_dim)
-        self.count = self.step_alpha
-
-    def update(self, adaptive_constant_new):
-        """Update weights with new gradient ratios (matching TF call)."""
-        if isinstance(adaptive_constant_new, list):
-            adaptive_constant_new = torch.tensor(
-                [[l.item() if isinstance(l, torch.Tensor) else l for l in adaptive_constant_new]],
-                dtype=torch.float32
-            )
-        if adaptive_constant_new.dim() == 1:
-            adaptive_constant_new = adaptive_constant_new.unsqueeze(0)
-
-        self.adaptive_constant = (
-            (1.0 - self.alpha) * self.adaptive_constant +
-            self.alpha * adaptive_constant_new
-        )
-
-        self.count += 1
-        if self.count > self.step_alpha:
-            self.adaptive_constant_step = self.adaptive_constant.clone()
-            self.count = 0
-
-    def get_weights(self):
-        """Return current adaptive weights."""
-        return self.adaptive_constant
-
-
 # =============================================================================
 # CollocationSolverND - Core PINN Solver
 # =============================================================================
@@ -81,8 +30,6 @@ class CollocationSolverND:
     Manages:
     - Model compilation and training
     - Loss computation (residual + BC + JFO interaction)
-    - PCGrad gradient projection
-    - Adaptive loss weighting
     - RAD (Residual-based Adaptive Distribution) refinement
     """
 
@@ -106,13 +53,8 @@ class CollocationSolverND:
         self.best_weights_path = 'epochs_best_model.pt'
 
         # Config flags
-        self.PCGrad_true = False
-        self.Boundary_true = True
         self.two_output = False
         self.none_zero = False
-        self.adapt_True = False
-        self.MTL_adapt = False
-        self.balance = False
 
         # Extra models (set externally)
         self.f_model_FB = None
@@ -123,8 +65,6 @@ class CollocationSolverND:
     # =========================================================================
     def compile(self, layer_sizes, f_model_list, domain, bcs,
                 u_model_switch=1, two_output=False, none_zero=False,
-                adapt_True=False, isAdaptive=False, MTL_adapt=False,
-                PCGrad_true=False, Boundary_true=True,
                 R_range=None, theta_range=None, batch_size=None,
                 core='mlp', kan_grid_size=5, kan_spline_order=3,
                 output_head_dim=64):
@@ -142,12 +82,8 @@ class CollocationSolverND:
         self.layer_sizes = layer_sizes
         self.bcs = bcs
         self.domain = domain
-        self.PCGrad_true = PCGrad_true
-        self.Boundary_true = Boundary_true
         self.two_output = two_output
         self.none_zero = none_zero
-        self.adapt_True = adapt_True
-        self.MTL_adapt = MTL_adapt
         self.R_range = R_range if R_range else []
         self.theta_range = theta_range if theta_range else []
         self.core = core
@@ -223,24 +159,6 @@ class CollocationSolverND:
             betas=(0.99, 0.999)
         )
 
-        # Adaptive loss weighting (matching TF)
-        n_loss_terms = len(self._get_loss_list())
-        self.adaptive_constant_alpha = 0.2
-        self.adaptive_constant_func = ComputeSum_weight(n_loss_terms, self.adaptive_constant_alpha)
-
-        # PCGrad loss weighting (matching TF)
-        self.adaptive_constant_alpha_PCGrad_loss = 0.1
-        self.adaptive_constant_func_PCGrad_loss = ComputeSum_weight(
-            n_loss_terms, self.adaptive_constant_alpha_PCGrad_loss
-        )
-
-        self.adaptive_constant_func_list = []
-
-        # MTL_adapt parameters
-        if self.MTL_adapt:
-            self.MTL_adapt_par = nn.Parameter(torch.ones(n_loss_terms, device=self.device))
-            self.MTL_adapt_list = []
-
         # Weight sizes for L-BFGS
         sizes_w, sizes_b = [], []
         for name, param in self.u_model.named_parameters():
@@ -254,7 +172,7 @@ class CollocationSolverND:
         # Save initial weights
         self._save_best()
 
-        # Batch settings
+        # Store batch settings
         self.batch_size = batch_size
         self.n_batches = 1
 
@@ -273,10 +191,8 @@ class CollocationSolverND:
         Get a representative loss list to determine n_loss_terms.
         Must match update_loss_seperate() structure.
         """
-        # We have: len(f_model_list) residuals + (1 BC if Boundary_true) + (1 JFO if two_output)
-        n = len(self.f_model_list)
-        if self.Boundary_true:
-            n += 1
+        # We have: len(f_model_list) residuals + 1 BC + (1 JFO if two_output)
+        n = len(self.f_model_list) + 1
         if self.two_output:
             n += 1
         if self.none_zero:
@@ -365,7 +281,7 @@ class CollocationSolverND:
 
     def update_loss_seperate(self):
         """
-        Compute all loss terms separately (for PCGrad).
+        Compute all loss terms separately.
         Returns list: [res_0, ..., res_n, bc_loss(es), jfo_loss, ...]
         Supports minibatch via self.batch_size.
         """
@@ -381,9 +297,8 @@ class CollocationSolverND:
             loss_all = loss_all + loss_res
 
         # Boundary condition losses
-        if self.Boundary_true:
-            loss_bcs = self.update_loss_bcs()
-            loss_all = loss_all + loss_bcs
+        loss_bcs = self.update_loss_bcs()
+        loss_all = loss_all + loss_bcs
 
         # JFO interaction loss — use minibatch
         if self.two_output:
@@ -398,129 +313,40 @@ class CollocationSolverND:
         return loss_all
 
     def update_loss(self):
-        """Compute total weighted loss (for L-BFGS)."""
+        """Compute total loss (for L-BFGS)."""
         loss_all = self.update_loss_seperate()
-        w = self.adaptive_constant_func.adaptive_constant.to(self.device)
-
-        loss_total = w[0, 0] * loss_all[0]
-        for i in range(1, len(loss_all)):
-            loss_total = loss_total + w[0, min(i, w.shape[1] - 1)] * loss_all[i]
-
+        loss_total = sum(loss_all)
         return loss_total, loss_all
-
-    # =========================================================================
-    # Gradient Computation with PCGrad + Adaptive Weighting
-    # =========================================================================
-    def grad_separate_all_with_adapt_weight(self):
-        """
-        Compute gradients with PCGrad projection and adaptive weighting.
-        This is the core gradient function matching TF's implementation.
-        """
-        loss_all = self.update_loss_seperate()
-
-        # Total loss (for standard gradient or as base for PCGrad)
-        if self.MTL_adapt:
-            # Log-variance weighting: sum(exp(-w_i) * loss_i + w_i)
-            loss_total = sum(
-                0.5 * torch.exp(-self.MTL_adapt_par[i]) * loss_all[i] + self.MTL_adapt_par[i]
-                for i in range(len(loss_all))
-            )
-        else:
-            w = self.adaptive_constant_func.adaptive_constant.to(self.device)
-            loss_total = w[0, 0] * loss_all[0]
-            for i in range(1, len(loss_all)):
-                loss_total = loss_total + w[0, min(i, w.shape[1] - 1)] * loss_all[i]
-
-        # Adaptive weight update (matching TF adapt_True logic)
-        if self.adapt_True:
-            self._update_adaptive_weights(loss_all)
-
-        # PCGrad gradient projection
-        if self.PCGrad_true:
-            grads, _ = pcgrad(
-                loss_all,
-                list(self.u_model.parameters()),
-                self.adaptive_constant_func_PCGrad_loss,
-                self.balance
-            )
-            return loss_total, grads, loss_all
-        else:
-            grads = torch.autograd.grad(
-                loss_total, self.u_model.parameters(),
-                retain_graph=True, create_graph=False
-            )
-            grads = [g if g is not None else torch.zeros_like(p)
-                     for g, p in zip(grads, self.u_model.parameters())]
-            return loss_total, grads, loss_all
-
-    def _update_adaptive_weights(self, loss_all):
-        """Update adaptive weights based on gradient magnitude ratios (matching TF)."""
-        params = list(self.u_model.parameters())
-
-        # Compute per-loss gradients
-        grad_all = []
-        for loss in loss_all:
-            g = torch.autograd.grad(loss, params, retain_graph=True, create_graph=True)
-            g_clean = [gi if gi is not None else torch.zeros_like(p) for gi, p in zip(g, params)]
-            grad_all.append(g_clean)
-
-        # Extract weight (kernel) gradients only
-        grad_all_w = []
-        for grads in grad_all:
-            w_grads = [g for name, g in zip(
-                [n for n, _ in self.u_model.named_parameters()], grads
-            ) if 'weight' in name]
-            grad_all_w.append(w_grads)
-
-        if len(grad_all_w) < 2:
-            return
-
-        # Residual gradient mean magnitude
-        grad_res_num = sum(g.numel() for g in grad_all_w[0])
-        grad_res_sum = sum(torch.sum(torch.abs(g)) for g in grad_all_w[0])
-        grads_res_mean = grad_res_sum / (grad_res_num + 1e-12)
-
-        # BC/interaction gradient mean magnitudes
-        grad_w_nums = [sum(g.numel() for g in gw) for gw in grad_all_w]
-        grad_w_sums = [sum(torch.sum(torch.abs(g)) for g in gw) for gw in grad_all_w]
-        grads_mean_list = [
-            s / (n + 1e-12) for s, n in zip(grad_w_sums, grad_w_nums)
-        ]
-
-        # Compute new weight ratios
-        adaptive_constant_new = [grads_res_mean / (grads_mean_list[i] + 1e-12) for i in range(len(grads_mean_list))]
-        adaptive_constant_new = [torch.clamp(w, 1e-2, 1e12) for w in adaptive_constant_new]
-        self.adaptive_constant_func.update(adaptive_constant_new)
 
     # =========================================================================
     # Training
     # =========================================================================
     def train_step(self):
-        """Single Adam training step with PCGrad."""
+        """Single Adam training step."""
         self.u_model.train()
-
-        loss_total, grads, loss_all = self.grad_separate_all_with_adapt_weight()
-
-        # Apply gradients
         self.tf_optimizer.zero_grad()
-        for param, grad in zip(self.u_model.parameters(), grads):
-            param.grad = grad
+
+        loss_all = self.update_loss_seperate()
+        loss_total = sum(loss_all)
+
+        loss_total.backward()
         self.tf_optimizer.step()
 
         return loss_total.detach(), [l.detach() for l in loss_all]
 
-    def fit(self, tf_iter=0, newton_iter=0, batch_sz=None, newton_eager=True):
+    def fit(self, tf_iter=0, newton_iter=0, batch_sz=None, newton_eager=True, scheduler=None):
         """
-        Main training entry point (matching TF's CollocationSolverND.fit).
+        Main training entry point.
 
         Args:
             tf_iter: number of Adam iterations
             newton_iter: number of L-BFGS iterations (0 to skip)
             batch_sz: batch size for minibatching
             newton_eager: whether to use eager L-BFGS
+            scheduler: optional torch LR scheduler (stepped each epoch)
         """
         from .fit import fit as fit_func
-        fit_func(self, tf_iter=tf_iter, newton_iter=newton_iter, newton_eager=newton_eager)
+        fit_func(self, tf_iter=tf_iter, newton_iter=newton_iter, newton_eager=newton_eager, scheduler=scheduler)
 
     def get_loss_and_flat_grad(self):
         """Return closure for L-BFGS (matching TF's get_loss_and_flat_grad)."""

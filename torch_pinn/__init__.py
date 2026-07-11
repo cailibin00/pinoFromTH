@@ -14,7 +14,7 @@ from .networks import (
     auto_pikan_layer_sizes,
 )
 
-from .models import CollocationSolverND, ComputeSum_weight
+from .models import CollocationSolverND
 
 from .domains import DomainND
 
@@ -41,8 +41,6 @@ from .utils import (
     to_torch,
     grad,
 )
-
-from .pcgrad import pcgrad
 
 from .optimizers import LBFGS_Trainer
 
