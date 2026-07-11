@@ -54,7 +54,7 @@ def fit(obj, tf_iter=0, newton_iter=0, newton_eager=True, scheduler=None):
                     obj.loss_all_history.append([l.item() for l in loss_all])
 
                     if epoch % 500 == 0 and len(loss_all) >= 2:
-                        loss_names = ['L_Reynolds', 'L_FB']
+                        loss_names = ['L_Reynolds', 'L_BC', 'L_FB']
                         loss_str = ' | '.join([
                             f'{name}={loss_all[i].item():.3e}'
                             for i, name in enumerate(loss_names) if i < len(loss_all)

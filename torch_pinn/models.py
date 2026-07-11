@@ -322,16 +322,86 @@ class CollocationSolverND:
     # Training
     # =========================================================================
     def train_step(self):
-        """Single Adam training step."""
+        """
+        Single Adam training step with PCGrad.
+
+        PCGrad (Projecting Conflicting Gradients):
+        1. Compute each loss term's gradient separately
+        2. Project away gradient components that conflict between tasks
+        3. Sum projected gradients and apply to parameters
+
+        This is essential for JFO cavitation PINN: without it, the Reynolds
+        residual gradient (~1e8) completely swamps the Fischer-Burmeister
+        complementarity gradient, which starts at ZERO when gamma≈0 (since
+        FB = p+γ-√(p²+γ²) = 0).  PCGrad lets the tiny FB signal survive
+        independently, slowly pushing gamma away from zero to learn cavitation.
+        """
         self.u_model.train()
         self.tf_optimizer.zero_grad()
 
         loss_all = self.update_loss_seperate()
-        loss_total = sum(loss_all)
+        num_tasks = len(loss_all)
 
-        loss_total.backward()
+        if num_tasks <= 1:
+            loss_total = sum(loss_all)
+            loss_total.backward()
+            self.tf_optimizer.step()
+            return loss_total.detach(), [l.detach() for l in loss_all]
+
+        # ---- 1. Compute per-task gradients ----
+        all_grads = []
+        for loss in loss_all:
+            # retain_graph=True required: f_model_FBNS uses autograd.grad
+            # internally with create_graph=True for 2nd-order derivatives
+            loss.backward(retain_graph=True)
+            grads = []
+            for p in self.u_model.parameters():
+                if p.grad is not None:
+                    grads.append(p.grad.clone())
+                else:
+                    grads.append(torch.zeros_like(p))
+            all_grads.append(grads)
+            self.tf_optimizer.zero_grad()
+
+        # ---- 2. Flatten gradients ----
+        flat_grads = []
+        for grads in all_grads:
+            flat = torch.cat([g.reshape(-1) for g in grads])
+            flat_grads.append(flat)
+
+        # ---- 3. PCGrad projection (matching TF exactly) ----
+        # Shuffle order for fairness
+        order = list(range(num_tasks))
+        rng = np.random.default_rng()
+        rng.shuffle(order)
+
+        proj_grads = {}
+        for i in order:
+            gi = flat_grads[i].clone()
+            for j in range(num_tasks):
+                if j == i:
+                    continue
+                gj = flat_grads[j]
+                dot_ij = torch.dot(gi, gj)
+                if dot_ij < 0:  # gradients conflict → project away
+                    norm_j = torch.dot(gj, gj) + 1e-12
+                    gi = gi - (dot_ij / norm_j) * gj
+            proj_grads[i] = gi
+
+        # ---- 4. Sum projected gradients ----
+        total_flat = sum(proj_grads.values())
+
+        # ---- 5. Unflatten and assign to parameters ----
+        offset = 0
+        for p in self.u_model.parameters():
+            if p.requires_grad:
+                n = p.numel()
+                p.grad = total_flat[offset:offset + n].view_as(p).clone()
+                offset += n
+
         self.tf_optimizer.step()
 
+        loss_total = sum(loss_all)
         return loss_total.detach(), [l.detach() for l in loss_all]
 
     def fit(self, tf_iter=0, newton_iter=0, batch_sz=None, newton_eager=True, scheduler=None):
