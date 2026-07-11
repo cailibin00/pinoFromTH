@@ -71,7 +71,7 @@ class Config:
 
     # Model architecture
     core = "mlp"            # "mlp" (standard MLP) or "pikan" (KAN-based architecture)
-    layer_sizes = [2, 128, 128, 256, 256, 256, 128, 2]  # MLP layer sizes
+    layer_sizes = [2, 128, 128, 256, 256, 128, 2]  # MLP layer sizes
     output_head_dim = 64    # hidden dim inside deep output heads (P: 128→64→1, γ: 128→64→cat→64→1)
     # PIKAN params (only used when core == "pikan")
     kan_grid_size = 5       # B‑spline grid intervals
