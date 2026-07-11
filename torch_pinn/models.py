@@ -363,35 +363,57 @@ class CollocationSolverND:
             all_grads.append(grads)
             self.tf_optimizer.zero_grad()
 
-        # ---- 2. Flatten gradients ----
+        # ---- 2. Flatten gradients and compute norms ----
         flat_grads = []
+        grad_norms = []
         for grads in all_grads:
             flat = torch.cat([g.reshape(-1) for g in grads])
             flat_grads.append(flat)
+            grad_norms.append(torch.norm(flat) + 1e-12)
 
-        # ---- 3. PCGrad projection (matching TF exactly) ----
-        # Shuffle order for fairness
+        # ---- 3. Normalize gradients to unit length ----
+        # Essential when gradient magnitudes differ by orders of magnitude
+        # (e.g. Reynolds ~1e8 vs FB ~1e-4). Without normalization, PCGrad's
+        # projection step becomes numerically unstable because dot(g_big, g_tiny)
+        # / norm(g_tiny) → ∞ when the denominator is near zero.
+        normed_grads = [g / n for g, n in zip(flat_grads, grad_norms)]
+
+        # ---- 4. PCGrad projection on normalized gradients ----
+        # Working in direction-space: each task contributes equally to the
+        # final direction, and we only resolve conflicts in direction, not
+        # magnitude. The original magnitudes are restored in step 6.
         order = list(range(num_tasks))
         rng = np.random.default_rng()
         rng.shuffle(order)
 
         proj_grads = {}
         for i in order:
-            gi = flat_grads[i].clone()
+            gi = normed_grads[i].clone()
             for j in range(num_tasks):
                 if j == i:
                     continue
-                gj = flat_grads[j]
+                gj = normed_grads[j]
                 dot_ij = torch.dot(gi, gj)
                 if dot_ij < 0:  # gradients conflict → project away
-                    norm_j = torch.dot(gj, gj) + 1e-12
-                    gi = gi - (dot_ij / norm_j) * gj
+                    norm_j_sq = torch.dot(gj, gj)  # ≈ 1.0 since normalized
+                    gi = gi - (dot_ij / norm_j_sq) * gj
             proj_grads[i] = gi
 
-        # ---- 4. Sum projected gradients ----
-        total_flat = sum(proj_grads.values())
+        # ---- 5. Sum projected unit directions ----
+        total_dir = sum(proj_grads.values())
 
-        # ---- 5. Unflatten and assign to parameters ----
+        # ---- 6. Scale back: use average of original gradient norms ----
+        # This gives a step size that averages what each task "wanted",
+        # preventing Reynolds from dominating while keeping updates meaningful.
+        avg_norm = sum(grad_norms) / len(grad_norms)
+        # Also apply gradient clipping for safety against outliers
+        total_flat = total_dir * avg_norm
+        total_norm = torch.norm(total_flat)
+        max_norm = 10.0
+        if total_norm > max_norm:
+            total_flat = total_flat * (max_norm / total_norm)
+
+        # ---- 7. Unflatten and assign to parameters ----
         offset = 0
         for p in self.u_model.parameters():
             if p.requires_grad:
