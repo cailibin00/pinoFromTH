@@ -13,6 +13,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib import cm
 import torch
+from reynold_pinn_torch import Config
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -21,10 +22,10 @@ def _p(filename):
 
 
 class Args:
-    model_path = os.path.join(_HERE, "output_torch", "checkpoints", "epochs_best_model.pt")
+    model_path = os.path.join(_HERE, Config.output_dir, "checkpoints", "epochs_best_model.pt")
     fem_p      = _p("p_FBNS.txt")
     fem_g      = _p("g_FBNS.txt")
-    out_dir    = os.path.join(_HERE, "output_torch", "comparison_results_iso_v16")
+    out_dir    = os.path.join(_HERE, Config.output_dir, "comparison_results_iso_v16")
     n_grid     = 201
     dpi        = 300
 
