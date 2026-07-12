@@ -64,7 +64,7 @@ class Config:
     ratio_RAD_list = [0.03, 0.01]  # RAD sampling ratios
 
     # Hardware / batch
-    device = "cuda"         # "cuda", "cpu", or "auto" (auto-select CUDA if available)
+    device = "cuda:6"         # "cuda", "cpu", or "auto" (auto-select CUDA if available)
     batch_size = None       # minibatch size; None = full-batch, int = stochastic minibatch
 
     output_dir = "output_torch1"
@@ -73,6 +73,7 @@ class Config:
     core = "mlp"            # "mlp" (standard MLP) or "pikan" (KAN-based architecture)
     layer_sizes = [2, 128, 128, 256, 256, 128, 2]  # MLP layer sizes
     output_head_dim = 64    # hidden dim inside deep output heads (P: 128→64→1, γ: 128→64→cat→64→1)
+    use_residual = False     # enable/disable residual skip connections in hidden + output layers
     # PIKAN params (only used when core == "pikan")
     kan_grid_size = 5       # B‑spline grid intervals
     kan_spline_order = 3    # B‑spline polynomial order
@@ -504,6 +505,7 @@ def main():
         kan_grid_size=cfg.kan_grid_size,
         kan_spline_order=cfg.kan_spline_order,
         output_head_dim=cfg.output_head_dim,
+        use_residual=cfg.use_residual,
     )
 
     # Print param‑count comparison

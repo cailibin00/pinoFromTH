@@ -215,7 +215,7 @@ class new_neural_period_polar_exactBC_two_output(nn.Module):
     """
 
     def __init__(self, layer_sizes, bc_values, r_lim, theta_lim,
-                 output_head_dim=64):
+                 output_head_dim=64, use_residual=True):
         """
         Args:
             layer_sizes: [in_dim, cos_units, hidden_0, ..., hidden_N, out_dim]
@@ -224,6 +224,7 @@ class new_neural_period_polar_exactBC_two_output(nn.Module):
             r_lim:       [r_min, r_max]
             theta_lim:   [theta_min, theta_max]
             output_head_dim: hidden dimension inside the deep output heads
+            use_residual: whether to use residual skip connections in hidden layers
         """
         super(new_neural_period_polar_exactBC_two_output, self).__init__()
 
@@ -237,6 +238,8 @@ class new_neural_period_polar_exactBC_two_output(nn.Module):
         hidden_w    = list(layer_sizes[2:-1]) # all hidden widths
         base_width  = hidden_w[0]             # U / V baseline dimension
         last_dim    = hidden_w[-1]            # last hidden → input to output heads
+
+        self.use_residual = use_residual
 
         # ---- 1. Fourier feature encoding ----
         self.coslayer = Coslayer_normalization(
@@ -376,7 +379,7 @@ class new_neural_period_polar_exactBC_two_output(nn.Module):
             main = gate * U_w + (1.0 - gate) * V_w   # [N, w]
 
             # Residual skip from previous layer
-            if prev is not None:
+            if prev is not None and self.use_residual:
                 skip = self.skip_proj[i - 1](prev)   # identity or projection
                 main = main + skip
 
@@ -392,19 +395,25 @@ class new_neural_period_polar_exactBC_two_output(nn.Module):
         # --- Pressure head ---
         #  last_dim → H  →  (H→H residual)  →  1
         p_h1 = F.silu(self.p_fc1(prev))
-        p_h2 = F.silu(self.p_fc2(p_h1)) + p_h1        # residual
+        p_h2 = F.silu(self.p_fc2(p_h1))
+        if self.use_residual:
+            p_h2 = p_h2 + p_h1                            # residual
         p_raw = self.p_fc_out(p_h2)                        # [N, 1]
 
         # --- Gamma head (stage 1) ---
         #  last_dim → H  →  (H→H residual)
         g_h1 = F.silu(self.g_fc1(prev))
-        g_h2 = F.silu(self.g_fc2(g_h1)) + g_h1        # residual
+        g_h2 = F.silu(self.g_fc2(g_h1))
+        if self.use_residual:
+            g_h2 = g_h2 + g_h1                             # residual
 
         # --- Gamma head (stage 2 — fuse pressure hidden state) ---
         #  concat(p_h2, g_h2)  →  H  →  (H→H residual)  →  1
         g_cat  = torch.cat([p_h2, g_h2], dim=1)            # [N, 2H]
         g_cat1 = F.silu(self.g_cat_fc1(g_cat))
-        g_cat2 = F.silu(self.g_cat_fc2(g_cat1)) + g_cat1  # residual
+        g_cat2 = F.silu(self.g_cat_fc2(g_cat1))
+        if self.use_residual:
+            g_cat2 = g_cat2 + g_cat1                       # residual
         g_raw  = self.g_fc_out(g_cat2)                     # [N, 1]
 
         # ================================================================
@@ -587,7 +596,8 @@ class PIKAN_Polar_BC_Two_Output(nn.Module):
     """
 
     def __init__(self, layer_sizes, bc_values, r_lim, theta_lim,
-                 kan_grid_size=5, kan_spline_order=3, output_head_dim=64):
+                 kan_grid_size=5, kan_spline_order=3, output_head_dim=64,
+                 use_residual=True):
         """
         Args:
             layer_sizes: [input_dim, cos_units, hidden, ..., hidden, output_dim]
@@ -599,6 +609,7 @@ class PIKAN_Polar_BC_Two_Output(nn.Module):
             kan_grid_size:    G — number of B‑spline grid intervals
             kan_spline_order: K — polynomial order of B‑splines
             output_head_dim:  hidden dim inside deep output heads
+            use_residual: whether to use residual skip connections
         """
         super(PIKAN_Polar_BC_Two_Output, self).__init__()
 
@@ -609,6 +620,7 @@ class PIKAN_Polar_BC_Two_Output(nn.Module):
         self.head_dim = output_head_dim
         self.kan_grid_size = kan_grid_size
         self.kan_spline_order = kan_spline_order
+        self.use_residual = use_residual
 
         cos_units = layer_sizes[1]
         hidden_w  = list(layer_sizes[2:-1])
@@ -766,7 +778,7 @@ class PIKAN_Polar_BC_Two_Output(nn.Module):
             main = gate * U_w + (1.0 - gate) * V_w   # [N, w]
 
             # Residual skip
-            if prev is not None:
+            if prev is not None and self.use_residual:
                 skip = self.skip_proj[i - 1](prev)
                 main = main + skip
 
@@ -777,17 +789,23 @@ class PIKAN_Polar_BC_Two_Output(nn.Module):
 
         # Pressure head
         p_h1  = F.silu(self.p_fc1(prev))
-        p_h2  = F.silu(self.p_fc2(p_h1)) + p_h1
+        p_h2  = F.silu(self.p_fc2(p_h1))
+        if self.use_residual:
+            p_h2 = p_h2 + p_h1
         p_raw = self.p_fc_out(p_h2)
 
         # Gamma head stage 1
         g_h1 = F.silu(self.g_fc1(prev))
-        g_h2 = F.silu(self.g_fc2(g_h1)) + g_h1
+        g_h2 = F.silu(self.g_fc2(g_h1))
+        if self.use_residual:
+            g_h2 = g_h2 + g_h1
 
         # Gamma head stage 2 (fuse pressure info)
         g_cat  = torch.cat([p_h2, g_h2], dim=1)
         g_cat1 = F.silu(self.g_cat_fc1(g_cat))
-        g_cat2 = F.silu(self.g_cat_fc2(g_cat1)) + g_cat1
+        g_cat2 = F.silu(self.g_cat_fc2(g_cat1))
+        if self.use_residual:
+            g_cat2 = g_cat2 + g_cat1
         g_raw  = self.g_fc_out(g_cat2)
 
         # ---- BC distance functions ----

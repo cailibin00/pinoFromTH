@@ -67,7 +67,7 @@ class CollocationSolverND:
                 u_model_switch=1, two_output=False, none_zero=False,
                 R_range=None, theta_range=None, batch_size=None,
                 core='mlp', kan_grid_size=5, kan_spline_order=3,
-                output_head_dim=64):
+                output_head_dim=64, use_residual=True):
         """
         Configure the solver.
 
@@ -78,6 +78,7 @@ class CollocationSolverND:
             kan_grid_size: B‑spline grid intervals (PIKAN only)
             kan_spline_order: B‑spline polynomial order (PIKAN only)
             output_head_dim: hidden dim inside deep output heads
+            use_residual: whether to use residual skip connections
         """
         self.layer_sizes = layer_sizes
         self.bcs = bcs
@@ -115,6 +116,7 @@ class CollocationSolverND:
                     kan_grid_size=kan_grid_size,
                     kan_spline_order=kan_spline_order,
                     output_head_dim=output_head_dim,
+                    use_residual=use_residual,
                 )
 
                 # Print parameter summary
@@ -129,6 +131,7 @@ class CollocationSolverND:
                 self.u_model = new_neural_period_polar_exactBC_two_output(
                     layer_sizes, bc_values, self.R_range, self.theta_range,
                     output_head_dim=output_head_dim,
+                    use_residual=use_residual,
                 )
 
                 trainable, total = count_model_params(self.u_model)
