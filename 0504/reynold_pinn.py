@@ -104,6 +104,8 @@ class Config:
     N_train = 10000         # 每阶段训练迭代数
     NL_train = 4           # RAD细化轮数
     ratio_RAD_list = [0.03, 0.01]  # RAD采样比例
+    use_RAD = False          # 是否启用 RAD 配点重采样 (False=完全关闭)
+    RAD_frequency = "stage" # RAD 触发频率: "round"=每轮, "stage"=仅阶段边界, 整数=每N轮
     batch_size = 2048      # minibatch大小; None=全批量, int=随机minibatch
 
     # 诊断参数
@@ -347,14 +349,28 @@ def train_model(model, cfg: Config, N_f_true, params=None, diag=None):
                 if diag is not None and cfg.diag_enabled and remaining > 0:
                     diag.snapshot(global_epoch)
 
-            # RAD 细化
-            model.RAD_FB(
-                model.f_model_list + [model.f_model_FB],
-                N_f_true,
-                num_add_points_test=round(10 * N_f_true),
-                num_add_points=[round(r * N_f_true) for r in cfg.ratio_RAD_list],
-                k=1, c=1e-16
-            )
+            # RAD 细化 (可通过 cfg.use_RAD 关闭，cfg.RAD_frequency 控制频率)
+            if cfg.use_RAD:
+                do_rad = False
+                if cfg.RAD_frequency == "round":
+                    do_rad = True
+                elif cfg.RAD_frequency == "stage":
+                    do_rad = (round_idx == cfg.NL_train - 1)  # 仅在每阶段最后一轮
+                elif isinstance(cfg.RAD_frequency, int):
+                    do_rad = (round_idx % cfg.RAD_frequency == 0)
+                # 最后一轮之后不需要 RAD (训练结束)
+                is_last_round = (stage_idx == len(lr_schedules) - 1 and round_idx == cfg.NL_train - 1)
+                if do_rad and not is_last_round:
+                    print(f"    [RAD] resampling collocation points...")
+                    model.RAD_FB(
+                        model.f_model_list + [model.f_model_FB],
+                        N_f_true,
+                        num_add_points_test=round(10 * N_f_true),
+                        num_add_points=[round(r * N_f_true) for r in cfg.ratio_RAD_list],
+                        k=1, c=1e-16
+                    )
+                else:
+                    print(f"    [RAD] skipped (frequency={cfg.RAD_frequency}, round={round_idx+1})")
 
     # 训练结束 → 最终阶段边界快照
     if diag is not None and cfg.diag_enabled:
