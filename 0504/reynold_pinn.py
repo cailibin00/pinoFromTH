@@ -24,6 +24,7 @@ from tensordiffeq.boundaries import dirichletBC
 from tensordiffeq.domains import DomainND
 from tensordiffeq.models import CollocationSolverND
 from tensordiffeq.utils import get_tf_model
+from diagnose import TrainingDiagnostics, post_training_analysis, gradient_impact_detailed_analysis
 
 
 # =============================================================================
@@ -101,6 +102,10 @@ class Config:
     NL_train = 4           # RAD细化轮数
     ratio_RAD_list = [0.03, 0.01]  # RAD采样比例
     batch_size = 2048      # minibatch大小; None=全批量, int=随机minibatch
+
+    # 诊断参数
+    diag_enabled = True         # 是否启用训练诊断
+    diag_interval = 500         # 诊断快照间隔 (epoch 数); 0=仅阶段边界
 
     # 硬件 / 输出
     output_dir = "output_tf"  # 输出目录
@@ -288,33 +293,71 @@ def generate_groove_points(theta_sym, params, cfg: Config):
 # =============================================================================
 # 6. 训练流程
 # =============================================================================
-def train_model(model, cfg: Config, N_f_true):
-    """多阶段训练流程"""
-    # 学习率配置
+def train_model(model, cfg: Config, N_f_true, params=None, diag=None):
+    """
+    多阶段训练流程（集成诊断钩子）。
+
+    Args:
+        model: CollocationSolverND 实例
+        cfg: Config
+        N_f_true: 实际配点数
+        params: 物理参数字典 (诊断需要)
+        diag: TrainingDiagnostics 实例 (None=不启用)
+    """
     lr_schedules = [
         {'boundaries': [20000, 40000], 'values': [1e-3, 1e-4, 1e-5]},
         {'boundaries': [20000, 40000], 'values': [1e-4, 1e-4, 1e-5]},
         {'boundaries': [20000, 40000], 'values': [1e-5, 1e-4, 1e-5]},
         {'boundaries': [20000, 40000], 'values': [1e-5, 1e-5, 1e-6]},
     ]
-    
-    for schedule in lr_schedules:
+
+    global_epoch = 0  # 跨所有阶段的累计 epoch
+
+    # 初始阶段边界快照 (epoch 0)
+    if diag is not None and cfg.diag_enabled:
+        diag.stage_boundary_snapshot(0, 0, 0)
+
+    for stage_idx, schedule in enumerate(lr_schedules):
         lr_decay = tf.keras.optimizers.schedules.PiecewiseConstantDecay(
             boundaries=schedule['boundaries'], values=schedule['values'])
-        
         model.tf_optimizer = tf.keras.optimizers.Adam(lr_decay, beta_1=0.99)
-        
-        for _ in range(cfg.NL_train):
-            model.fit(tf_iter=cfg.N_train, newton_iter=0, batch_sz=cfg.batch_size)
-            # 残差自适应细化
+        print(f"\n[Stage {stage_idx+1}/4] LR schedule: {schedule['values']}")
+
+        for round_idx in range(cfg.NL_train):
+            print(f"  Round {round_idx+1}/{cfg.NL_train} (epoch {global_epoch}–{global_epoch+cfg.N_train})")
+
+            # 阶段+轮次边界 → 详细梯度快照
+            if diag is not None and cfg.diag_enabled:
+                diag.stage_boundary_snapshot(stage_idx, round_idx, global_epoch)
+
+            # 分批训练以支持中间诊断快照
+            diag_interval = cfg.diag_interval if cfg.diag_enabled and cfg.diag_interval > 0 else cfg.N_train
+            remaining = cfg.N_train
+
+            while remaining > 0:
+                chunk = min(diag_interval, remaining)
+                model.fit(tf_iter=chunk, newton_iter=0, batch_sz=cfg.batch_size)
+                global_epoch += chunk
+                remaining -= chunk
+
+                # 中间轻量快照 (只有 PDE + 输出 + 轻量梯度)
+                if diag is not None and cfg.diag_enabled and remaining > 0:
+                    diag.snapshot(global_epoch)
+
+            # RAD 细化
             model.RAD_FB(
-                model.f_model_list + [model.f_model_FB], 
+                model.f_model_list + [model.f_model_FB],
                 N_f_true,
                 num_add_points_test=round(10 * N_f_true),
                 num_add_points=[round(r * N_f_true) for r in cfg.ratio_RAD_list],
                 k=1, c=1e-16
             )
-    
+
+    # 训练结束 → 最终阶段边界快照
+    if diag is not None and cfg.diag_enabled:
+        diag.stage_boundary_snapshot(3, cfg.NL_train - 1, global_epoch)
+        diag.finalize()
+
     return model
 
 
@@ -542,9 +585,20 @@ def main():
     model.f_model_FB = tf.function(f_model_FB)
     model.f_model_list = [get_tf_model(f_model_FBNS)]
 
+    # ---- 初始化诊断 ----
+    diag = None
+    if cfg.diag_enabled:
+        diag = TrainingDiagnostics(model, params, cfg, output_dir)
+
     # 训练
     print("Starting training...")
-    model = train_model(model, cfg, N_f_true)
+    model = train_model(model, cfg, N_f_true, params=params, diag=diag)
+
+    # ---- 训练后诊断 ----
+    if cfg.diag_enabled:
+        print("\n[Post-Training] Running full diagnosis...")
+        post_training_analysis(model, params, cfg, output_dir)
+        gradient_impact_detailed_analysis(model, params, cfg, output_dir)
 
     # 保存最终模型到 models/
     model_name = f'reynolds_pinn_N{cfg.N_f}_iter{cfg.N_train * cfg.NL_train * 4}'
