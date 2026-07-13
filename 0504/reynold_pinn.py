@@ -323,7 +323,7 @@ def train_model(model, cfg: Config, N_f_true, params=None, diag=None):
     for stage_idx, schedule in enumerate(lr_schedules):
         lr_decay = tf.keras.optimizers.schedules.PiecewiseConstantDecay(
             boundaries=schedule['boundaries'], values=schedule['values'])
-        model.tf_optimizer = tf.keras.optimizers.Adam(lr_decay, beta_1=0.99)
+        model.tf_optimizer = tf.keras.optimizers.legacy.Adam(lr_decay, beta_1=0.99)
         print(f"\n[Stage {stage_idx+1}/4] LR schedule: {schedule['values']}")
 
         for round_idx in range(cfg.NL_train):
