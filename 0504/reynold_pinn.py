@@ -6,6 +6,8 @@ Reynolds方程PINN求解器 - 螺旋槽空化问题
 日期: 2026
 """
 import os
+import sys
+import json
 
 # 获取脚本所在目录
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -25,42 +27,85 @@ from tensordiffeq.utils import get_tf_model
 
 
 # =============================================================================
+# 0. 辅助工具
+# =============================================================================
+def ensure_dir(path):
+    """创建目录（如不存在）。"""
+    os.makedirs(path, exist_ok=True)
+
+
+class Tee:
+    """同时输出到 stdout 和日志文件。"""
+    def __init__(self, log_path):
+        self.stdout = sys.stdout
+        self.log = open(log_path, 'w', encoding='utf-8', buffering=1)
+
+    def write(self, message):
+        self.stdout.write(message)
+        self.log.write(message)
+
+    def flush(self):
+        self.stdout.flush()
+        self.log.flush()
+
+    def close(self):
+        self.log.close()
+
+
+# =============================================================================
 # 1. 配置参数
 # =============================================================================
 class Config:
     """集中管理所有配置参数"""
-    
+
     # 几何参数 (单位: m)
     r_i = 47.0e-3          # 内径
     r_o = 52.0e-3          # 外径
     h_i = 3.0e-6           # 平衡膜厚
     K = 6.0                # 周期数(360度分6份)
-    
+
     # 螺旋槽几何
     R_d_1_ratio = 1.043    # 槽起始位置比例
     R_d_2_ratio = 1.106 * 2  # 槽结束位置比例(乘了2倍，完全贯通)
     alpha_deg = 3.0        # 螺旋角 (度)
     h_texture_ratio = 3.0  # 槽深/平衡膜厚比
     groove_ratio = 0.5     # 槽宽比
-    
+
     # 工况参数
     p_i = 0.1e6            # 内径压力 (Pa)
     p_o_ratio = 1.5        # 外径/内径压力比
     eta = 8.00e-4          # 动力粘度 (Pa·s)
     omega_rpm = 6000       # 转速 (rpm)
-    
+
     # 数值参数
-    N_f = 4900             # 配点数
+    N_f = 6000             # 配点数
     N_groove_b = 50        # 槽边界采样点数
     N_groove_r = 20        # 槽径向边界采样点数
     domain_fidelity = 50   # 域网格密度
-    
+
+    # ========== 模型架构参数（可配置） ==========
+    Act = "silu"            # 激活函数: "tanh" 或 "silu"
+    core = "mlp"            # 网络类型: "mlp" 或 "pikan" (KAN架构)
+    use_residual = True    # 是否使用残差连接
+    output_head_dim = 64    # 输出头隐藏层维度 (用于深度输出头)
+    coslayer_mode = "mlp"  # 输入编码层: "simple" (原版线性混合) 或 "mlp" (R/θ各自MLP通路)
+
+    # PIKAN 参数 (仅 core="pikan" 时生效)
+    kan_grid_size = 5       # B-spline 网格区间数
+    kan_spline_order = 3    # B-spline 多项式阶数
+    pikan_layer_sizes = [2, 64, 64, 64, 64, 2]  # PIKAN 层大小
+
     # 训练参数
-    layer_sizes = [2, 128, 128, 128, 128, 2]
-    N_train = 5000         # 每阶段训练迭代数
+    layer_sizes = [2, 128, 128, 256 ,128, 128, 2]
+    N_train = 1000         # 每阶段训练迭代数
     NL_train = 4           # RAD细化轮数
     ratio_RAD_list = [0.03, 0.01]  # RAD采样比例
-    
+    batch_size = 2048      # minibatch大小; None=全批量, int=随机minibatch
+
+    # 硬件 / 输出
+    output_dir = "output_tf"  # 输出目录
+    device = "0"              # GPU设备ID, "-1"=自动选择, "cpu"=仅CPU
+
     # 绘图参数
     dpi_save = 600
     dpi_watch = 150
@@ -260,7 +305,7 @@ def train_model(model, cfg: Config, N_f_true):
         model.tf_optimizer = tf.keras.optimizers.Adam(lr_decay, beta_1=0.99)
         
         for _ in range(cfg.NL_train):
-            model.fit(tf_iter=cfg.N_train, newton_iter=0)
+            model.fit(tf_iter=cfg.N_train, newton_iter=0, batch_sz=cfg.batch_size)
             # 残差自适应细化
             model.RAD_FB(
                 model.f_model_list + [model.f_model_FB], 
@@ -398,58 +443,136 @@ def plot_results(model, params, cfg: Config, save_prefix='result'):
 def main():
     # 初始化配置
     cfg = Config()
+
+    # ---- 设备设置 ----
+    if cfg.device.lower() == "cpu":
+        tf.config.set_visible_devices([], 'GPU')
+    elif cfg.device not in ("-1", "auto"):
+        gpu_id = int(cfg.device)
+        gpus = tf.config.list_physical_devices('GPU')
+        if gpus and gpu_id < len(gpus):
+            tf.config.set_visible_devices(gpus[gpu_id], 'GPU')
+
+    # ---- 输出目录结构 (匹配 PyTorch 版) ----
+    output_dir = os.path.join(SCRIPT_DIR, cfg.output_dir)
+    log_dir = os.path.join(output_dir, 'log')
+    ckpt_dir = os.path.join(output_dir, 'checkpoints')
+    models_dir = os.path.join(output_dir, 'models')
+    figures_dir = os.path.join(output_dir, 'figures')
+    ensure_dir(log_dir)
+    ensure_dir(ckpt_dir)
+    ensure_dir(models_dir)
+    ensure_dir(figures_dir)
+
+    # 重定向 stdout 到日志文件
+    log_path = os.path.join(log_dir, 'train.txt')
+    tee = Tee(log_path)
+    sys.stdout = tee
+
+    # ---- 打印配置摘要 ----
+    print("=" * 60)
+    print("Reynolds Equation PINN Solver (TensorFlow)")
+    print("=" * 60)
+    gpus = tf.config.list_physical_devices('GPU')
+    print(f"Device: GPU (visible: {len(gpus)})" if gpus else "Device: CPU")
+    print(f"Batch size: {cfg.batch_size if cfg.batch_size else 'full-batch'}")
+    print(f"Core: {cfg.core}")
+    print(f"Coslayer mode: {cfg.coslayer_mode}")
+    print(f"Activation: {cfg.Act}")
+    print(f"Residual: {cfg.use_residual}")
+    print(f"Layer sizes: {cfg.layer_sizes}")
+    if cfg.core == "pikan":
+        print(f"PIKAN: grid={cfg.kan_grid_size}, order={cfg.kan_spline_order}, "
+              f"layers={cfg.pikan_layer_sizes}")
+    print(f"Output dir: {output_dir}")
+
     params = compute_physical_params(cfg)
-    
+    print(f"Lambda = {float(params['Lambda']):.4f}")
+    print(f"P_i = {params['P_i']:.6f}, P_o = {params['P_o']:.6f}")
+    print(f"R_lim = {params['R_lim']}")
+    print(f"theta_lim = {params['theta_lim']}")
+
     # 创建膜厚函数和PDE模型
     H_func, theta_sym = create_H_func(params, cfg)
     f_model_FBNS, f_model_FB = create_pde_models(H_func, params)
-    
+
     # 创建计算域
     Domain = DomainND(["R", "theta"])
     Domain.add("R", params['R_lim'], cfg.domain_fidelity)
     Domain.add("theta", params['theta_lim'], cfg.domain_fidelity)
     Domain.X_f = Domain.generate_collocation_points(cfg.N_f, 1)
-    
+
     # 添加螺旋槽边界配点
     add_R, add_theta = generate_groove_points(theta_sym, params, cfg)
     Domain.X_f = np.concatenate([Domain.X_f, np.concatenate([add_R, add_theta], 1)], 0)
     N_f_true = len(Domain.X_f)
     print(f"Total collocation points: {N_f_true}")
-    
+
     # 设置边界条件
     lower_bc = dirichletBC(Domain, val=params['P_i'], var='R', target="lower")
     upper_bc = dirichletBC(Domain, val=params['P_o'], var='R', target="upper")
     BCs = [lower_bc, upper_bc]
-    
+
+    # 确定 u_model_switch: 8=mlp-two-output, 13=pikan-two-output
+    if cfg.core == "pikan":
+        u_model_switch = 13
+    else:
+        u_model_switch = 8
+
     # 创建并编译模型
     model = CollocationSolverND()
     model.compile(
         cfg.layer_sizes, [f_model_FBNS], Domain, BCs,
-        u_model_switch=8, two_output=True, none_zero=False, adapt_True=False,
-        isAdaptive=False, MTL_adapt=False, PCGrad_true=True, Boundary_true=False,
-        R_range=params['R_lim'], theta_range=params['theta_lim']
+        u_model_switch=u_model_switch, two_output=True, none_zero=False,
+        adapt_True=False, isAdaptive=False, MTL_adapt=False,
+        PCGrad_true=True, Boundary_true=False,
+        R_range=params['R_lim'], theta_range=params['theta_lim'],
+        Act=cfg.Act, use_residual=cfg.use_residual,
+        output_head_dim=cfg.output_head_dim, batch_size=cfg.batch_size,
+        coslayer_mode=cfg.coslayer_mode,
+        kan_grid_size=cfg.kan_grid_size, kan_spline_order=cfg.kan_spline_order,
+        pikan_layer_sizes=cfg.pikan_layer_sizes,
     )
 
-    model.best_weights_path = os.path.join(SCRIPT_DIR, 'epochs_best_model')
-    model.u_model.save_weights(model.best_weights_path)  # 重新初始化到正确位置
-    
+    # 最佳模型保存到 checkpoints/
+    model.best_weights_path = os.path.join(ckpt_dir, 'epochs_best_model')
+    model.u_model.save_weights(model.best_weights_path)
+
     # 设置额外模型
     model.f_model_FB = tf.function(f_model_FB)
     model.f_model_list = [get_tf_model(f_model_FBNS)]
-    
+
     # 训练
     print("Starting training...")
     model = train_model(model, cfg, N_f_true)
-    
-    # 保存模型
-    model_name = f'reynolds_pinn_N{cfg.N_f}_iter{cfg.N_train*cfg.NL_train*4}'
-    model_path = os.path.join(SCRIPT_DIR, model_name)
+
+    # 保存最终模型到 models/
+    model_name = f'reynolds_pinn_N{cfg.N_f}_iter{cfg.N_train * cfg.NL_train * 4}'
+    model_path = os.path.join(models_dir, model_name)
     model.save(model_path)
-    print(f"Model saved as: {model_path}")
-    
-    # 可视化结果
-    plot_results(model, params, cfg, save_prefix=model_path)
-    
+    print(f"Model saved to: {model_path}")
+
+    # 保存 loss history 为 JSON
+    loss_json_path = os.path.join(log_dir, 'loss_history.json')
+    with open(loss_json_path, 'w') as f:
+        json.dump({
+            'loss_history': [float(v) if hasattr(v, 'numpy') else v
+                             for v in model.loss_history],
+            'epoch_history': model.epoch_history,
+            'loss_all_history': [[float(vv) if hasattr(vv, 'numpy') else vv
+                                  for vv in v] for v in model.loss_all_history],
+        }, f, indent=2)
+    print(f"Loss history saved to: {loss_json_path}")
+
+    # 可视化结果保存到 figures/
+    fig_prefix = os.path.join(figures_dir, model_name)
+    plot_results(model, params, cfg, save_prefix=fig_prefix)
+
+    # 恢复 stdout
+    sys.stdout = tee.stdout
+    tee.close()
+
+    print(f"\nTraining complete! Output saved to: {output_dir}")
     return model
 
 

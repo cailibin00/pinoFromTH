@@ -20,7 +20,14 @@ class CollocationSolverND:
     def compile(self, layer_sizes, f_model_list, domain, bcs, isAdaptive=False,
                 dict_adaptive=None, init_weights=None, g=None, dist=False,
                 u_model_switch=1, two_output=False, none_zero = False, adapt_True = False,
-                MTL_adapt = False, PCGrad_true = False, Boundary_true = True, R_range = [],theta_range = []):
+                MTL_adapt = False, PCGrad_true = False, Boundary_true = True,
+                R_range = [], theta_range = [],
+                # ---- 新增可配置参数 ----
+                Act = "tanh", use_residual = False, output_head_dim = 64,
+                batch_size = None, device = "0",
+                coslayer_mode = "simple",
+                kan_grid_size = 5, kan_spline_order = 3,
+                pikan_layer_sizes = None):
         """
         Args:
             layer_sizes: A list of layer sizes, can be overwritten via resetting u_model to a keras model
@@ -33,6 +40,15 @@ class CollocationSolverND:
                           equal to the number of  residuals and boundares conditions, respectively
             g: a function in terms of `lambda` for self-adapting solving. Defaults to lambda^2
             dist: A boolean value determining whether the solving will be distributed across multiple GPUs
+            Act: "tanh" or "silu" activation function
+            use_residual: enable/disable residual skip connections
+            output_head_dim: hidden dim inside deep output heads
+            batch_size: minibatch size (None = full batch)
+            device: GPU device ID string (e.g. "0", "-1"=auto, "cpu")
+            coslayer_mode: "simple" (original linear mix) or "mlp" (separate R/theta MLP pathways)
+            kan_grid_size: B-spline grid intervals (for core="pikan")
+            kan_spline_order: B-spline polynomial order (for core="pikan")
+            pikan_layer_sizes: layer sizes for PIKAN (for core="pikan")
 
         Returns:
             None
@@ -77,7 +93,28 @@ class CollocationSolverND:
         elif self.u_model_switch == 8:
             self.R_range = R_range
             self.theta_range = theta_range
-            self.u_model = new_neural_period_polar_exactBC_two_output(self.layer_sizes, [self.bcs[0].val, self.bcs[1].val],self.R_range,self.theta_range)
+            self.u_model = new_neural_period_polar_exactBC_two_output(
+                self.layer_sizes,
+                [self.bcs[0].val, self.bcs[1].val],
+                self.R_range, self.theta_range,
+                activation=Act, use_residual=use_residual,
+                output_head_dim=output_head_dim,
+                coslayer_mode=coslayer_mode)
+
+        elif self.u_model_switch == 13:
+            # PIKAN (KAN-based architecture)
+            self.R_range = R_range
+            self.theta_range = theta_range
+            _pikan_layers = pikan_layer_sizes if pikan_layer_sizes is not None else layer_sizes
+            self.u_model = PIKAN_Polar_BC_Two_Output(
+                _pikan_layers,
+                [self.bcs[0].val, self.bcs[1].val],
+                self.R_range, self.theta_range,
+                kan_grid_size=kan_grid_size,
+                kan_spline_order=kan_spline_order,
+                output_head_dim=output_head_dim,
+                use_residual=use_residual,
+                coslayer_mode=coslayer_mode)
 
         elif self.u_model_switch == 9:
             self.R_range = R_range

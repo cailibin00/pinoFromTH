@@ -252,19 +252,13 @@ class CollocationSolverND:
         """Fischer-Burmeister complementarity: P + gamma - sqrt(P^2 + gamma^2) = 0."""
         X_f_batch = self._get_batch_X_f()
         u_preds = self.u_model(X_f_batch)
-        if not isinstance(u_preds, list):
-            u_preds = [u_preds]
-
-        loss_g_all = torch.tensor(0.0, device=self.device)
-        for u_pred in u_preds:
-            p, gamma = u_pred[0], u_pred[1]
-            loss_g = mse(
-                p + gamma - torch.sqrt(p ** 2 + gamma ** 2),
-                torch.zeros_like(p)
-            )
-            loss_g_all = loss_g_all + loss_g
-
-        return loss_g_all
+        # u_preds is [p_tensor, gamma_tensor], both shape [N, 1]
+        p, gamma = u_preds[0], u_preds[1]
+        loss_g = mse(
+            p + gamma - torch.sqrt(p ** 2 + gamma ** 2),
+            torch.zeros_like(p)
+        )
+        return loss_g
 
     def update_loss_0_boundary(self):
         """Non-negative penalty: (|u| * (-u) + u^2) / 2."""

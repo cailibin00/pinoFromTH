@@ -384,61 +384,104 @@ def new_neural_period_polar_exactBC(layer_sizes, bc_values, r_lim, theta_lim):
     return model
 
 
-def new_neural_period_polar_exactBC_two_output(layer_sizes,bc_values,r_lim,theta_lim):
-    inputs = tf.keras.Input(shape=(2,))  # Returns a placeholder tensor
+def new_neural_period_polar_exactBC_two_output(layer_sizes, bc_values, r_lim, theta_lim,
+                                                activation="tanh", use_residual=False,
+                                                output_head_dim=64, coslayer_mode="simple"):
+    """
+    Main PINN architecture for Reynolds equation with JFO cavitation.
 
-    '''kernel_one_zero = np.zeros((2, 1))
-    kernel_zero_one = np.zeros((2, 1))
-    kernel_one_zero[0, :] = 1.0
-    kernel_zero_one[1, :] = 1.0
+    Args:
+        layer_sizes: [in_dim, cos_units, hidden_0, ..., hidden_N, out_dim]
+        bc_values:   [bc_lower, bc_upper]
+        r_lim:       [r_min, r_max]
+        theta_lim:   [theta_min, theta_max]
+        activation:  "tanh" or "silu" — activation for U/V/gate/output branches
+        use_residual: whether to use residual skip connections
+        output_head_dim: hidden dim inside deep output heads
+        coslayer_mode: "simple" (original linear mix) or "mlp" (separate R/θ MLP pathways)
+    """
+    act_fn = tf.nn.tanh if activation == "tanh" else tf.nn.silu
 
-    inputs_r = tf.matmul(inputs, kernel_one_zero) #这就是所有的1#r
-    inputs_theta = tf.matmul(inputs, kernel_zero_one)  # 这就是所有的2#theta
+    inputs = tf.keras.Input(shape=(2,))
 
-    inputs_R = 2.0*(inputs_r-r_lim[0])/(r_lim[1]-r_lim[0])-1.0
-    inputs_Theta = 2.0 * (inputs_theta - theta_lim[0]) / (theta_lim[1] - theta_lim[0]) - 1.0
+    x, inputs_R = Coslayer_normalization(
+        layer_sizes[1], r_lim, theta_lim,
+        activation=tf.nn.tanh,
+        kernel_initializer="glorot_normal",
+        bias_initializer=tf.constant_initializer(0),
+        coslayer_mode=coslayer_mode
+    )(inputs)
 
-    inputs_new = tf.concat([inputs_R, inputs_Theta], 1)'''
+    # U / V base branches
+    base_width = layer_sizes[2]
+    x_U = layers.Dense(base_width, activation=act_fn, kernel_initializer="glorot_normal")(x)
+    x_V = layers.Dense(base_width, activation=act_fn, kernel_initializer="glorot_normal")(x)
 
-    x,inputs_R = Coslayer_normalization(layer_sizes[1],r_lim,theta_lim, activation=tf.nn.tanh, kernel_initializer="glorot_normal", bias_initializer=tf.constant_initializer(0))(inputs)
-    #x = layers.Dense(layer_sizes[2], activation=tf.nn.tanh, kernel_initializer="glorot_normal")(x)
-    x_U = layers.Dense(layer_sizes[2], activation=tf.nn.tanh, kernel_initializer="glorot_normal")(x)
-    x_V = layers.Dense(layer_sizes[2], activation=tf.nn.tanh, kernel_initializer="glorot_normal")(x)
-
-
-    x_1 = layers.Dense(1, activation=tf.nn.tanh, kernel_initializer="glorot_normal")(x)  # None
-    x_2 = layers.Dense(1, activation=tf.nn.tanh, kernel_initializer="glorot_normal")(x)  # None
+    # Hermite interpolation branches
+    x_1 = layers.Dense(1, activation=tf.nn.tanh, kernel_initializer="glorot_normal")(x)
+    x_2 = layers.Dense(1, activation=tf.nn.tanh, kernel_initializer="glorot_normal")(x)
     #x_3 = layers.Dense(1, activation=None, kernel_initializer="glorot_normal")(x)  # None
     #x_4 = layers.Dense(1, activation=tf.nn.tanh, kernel_initializer="glorot_normal")(x)  # None
     #x_5 = layers.Dense(1, activation=tf.nn.tanh, kernel_initializer="glorot_normal")(x)  # None
 
-    for width in layer_sizes[2:-1]:
-        x_t = layers.Dense(width, activation=tf.nn.tanh, kernel_initializer="glorot_normal")(x)#None
-        x = (x_t*x_U + (1-x_t)*x_V) #+ x
+    # Gated hidden layers with optional residual connections
+    hidden_w = list(layer_sizes[2:-1])
+    prev = None
 
-        #x_t = layers.Dense(width, activation=None, kernel_initializer="glorot_normal")(x)#None
-        #x = tf.nn.tanh((x_t*x_U + (1-x_t)*x_V)) #+ x
+    for i, w in enumerate(hidden_w):
+        # Gate from current x
+        x_t = layers.Dense(w, activation=tf.nn.tanh, kernel_initializer="glorot_normal")(x)
 
-        #x = layers.Dense(width, activation=tf.nn.tanh, kernel_initializer="glorot_normal")(x)
-    '''
-    
-    x_t_1 = layers.Dense(width, activation=None, kernel_initializer="glorot_normal")(x)
-    x_1 = tf.nn.tanh(x_t_1*x_U + (1-x_t_1)*x_V) #+ x
+        # U / V at current width (with projection if needed)
+        if w == base_width:
+            U_w, V_w = x_U, x_V
+        else:
+            U_w = layers.Dense(w, activation=act_fn, kernel_initializer="glorot_normal")(x_U)
+            V_w = layers.Dense(w, activation=act_fn, kernel_initializer="glorot_normal")(x_V)
 
-    x_t_2 = layers.Dense(width, activation=None, kernel_initializer="glorot_normal")(x)
-    x_2 = tf.nn.tanh(x_t_2*x_U + (1-x_t_2)*x_V) #+ x
-    '''
+        main = x_t * U_w + (1.0 - x_t) * V_w
 
-    '''for width in layer_sizes[1:-1]:
-       x = layers.Dense(width, activation=tf.nn.tanh,kernel_initializer="glorot_normal")(x)
-       x = layers.Dense(width, activation=tf.nn.tanh, kernel_initializer="glorot_normal")(x) + x
-    '''
-    predictions = layers.Dense(1, activation=None,use_bias=True,bias_initializer=tf.constant_initializer(0), kernel_initializer="glorot_normal")(x)
+        # Residual skip
+        if prev is not None and use_residual:
+            if prev.shape[-1] != w:
+                skip = layers.Dense(w, activation=None, kernel_initializer="glorot_normal")(prev)
+            else:
+                skip = prev
+            main = main + skip
 
-    prediction_g = layers.Dense(1, activation=None, use_bias=True, bias_initializer=tf.constant_initializer(0),kernel_initializer=tf.constant_initializer(1e-6))(x)  # -5 "glorot_normal" "glorot_normal"tf.constant_initializer(0)
+        prev = main
+        x = main
 
-    #predictions = layers.Dense(1, activation=None,use_bias=True,bias_initializer=tf.keras.initializers.HeNormal(), kernel_initializer=tf.keras.initializers.HeNormal())(x)
-    #prediction_g = layers.Dense(1, activation=None, use_bias=True, bias_initializer=tf.keras.initializers.HeNormal(),kernel_initializer=tf.keras.initializers.HeNormal())(x)  # -5
+    # x is now the last hidden state [N, last_dim]
+    last_dim = hidden_w[-1]
+    H = output_head_dim
+
+    # ---- Deep Output Head: Pressure ----
+    # last_dim -> H -> (H->H residual) -> 1
+    p_h1 = layers.Dense(H, activation=act_fn, kernel_initializer="glorot_normal")(x)
+    p_h2 = layers.Dense(H, activation=act_fn, kernel_initializer="glorot_normal")(p_h1)
+    if use_residual:
+        p_h2 = p_h2 + p_h1
+    p_raw = layers.Dense(1, activation=None, use_bias=True,
+                         bias_initializer=tf.constant_initializer(0),
+                         kernel_initializer="glorot_normal")(p_h2)
+
+    # ---- Deep Output Head: Gamma ----
+    # Stage 1: last_dim -> H -> (H->H residual)
+    g_h1 = layers.Dense(H, activation=act_fn, kernel_initializer="glorot_normal")(x)
+    g_h2 = layers.Dense(H, activation=act_fn, kernel_initializer="glorot_normal")(g_h1)
+    if use_residual:
+        g_h2 = g_h2 + g_h1
+
+    # Stage 2: concat(pressure_hidden, gamma_hidden) -> H -> (H->H residual) -> 1
+    g_cat = tf.concat([p_h2, g_h2], axis=1)
+    g_cat1 = layers.Dense(H, activation=act_fn, kernel_initializer="glorot_normal")(g_cat)
+    g_cat2 = layers.Dense(H, activation=act_fn, kernel_initializer="glorot_normal")(g_cat1)
+    if use_residual:
+        g_cat2 = g_cat2 + g_cat1
+    g_raw = layers.Dense(1, activation=None, use_bias=True,
+                         bias_initializer=tf.constant_initializer(0),
+                         kernel_initializer=tf.constant_initializer(1e-6))(g_cat2)
 
     #N=2
     #sigma_func = (1. - inputs_R) * (1. + inputs_R) / ((1. - inputs_R) ** N + (1. + inputs_R) ** N)**(1/N)
@@ -459,31 +502,19 @@ def new_neural_period_polar_exactBC_two_output(layer_sizes,bc_values,r_lim,theta
     #g_func_2 = Out_Imp_BC_value_layer(bc_values = bc_values_transform,para_Hermite_BC_initializer=tf.constant_initializer((bc_values_transform[1]-bc_values_transform[0])/2.))(inputs_R)#二次哈密顿插值
     #g_func_2 = Out_Imp_BC_value_layer(bc_values=[0.,0.],para_Hermite_BC_initializer=tf.constant_initializer(0.))(inputs_R)  # 二次哈密顿插值
 
-    g_func_2 = x_1 * (inputs_R + 1) * ((inputs_R - 1) / (-2)) ** 2 + x_2 * (inputs_R - 1) * ((inputs_R + 1) / (2)) ** 2  # 二点三次Hermite插值多项式
+    g_func_2 = x_1 * (inputs_R + 1) * ((inputs_R - 1) / (-2)) ** 2 + x_2 * (inputs_R - 1) * ((inputs_R + 1) / (2)) ** 2
 
     g_func = g_func_1 + g_func_2
 
-    predictions = g_func + sigma_func_1 * predictions
-    #predictions = g_func + (sigma_func_1_withNN+sigma_func_1) * predictions
-    #prediction_g = -10 + sigma_func * prediction_g
+    # BC enforcement
+    predictions = g_func + sigma_func_1 * p_raw
+    prediction_g = sigma_func_2 * g_raw
 
-    prediction_g = sigma_func_2 * prediction_g
-    #prediction_g = tf.nn.sigmoid(10*prediction_g-20)
-    #prediction_g = ((prediction_g)) ** 2
-    #prediction_g = (tf.nn.tanh(prediction_g))**2#tf.nn.tanh
-    prediction_g = (tf.nn.tanh(prediction_g))**2
+    # Non-negative outputs via tanh^2
+    predictions = tf.nn.tanh(predictions) ** 2
+    prediction_g = tf.nn.tanh(prediction_g) ** 2
 
-    #prediction_g = tf.nn.leaky_relu(tf.nn.tanh(prediction_g),alpha=1e-1)
-    #prediction_g = prediction_g * tf.nn.relu(prediction_g)
-    #prediction_g = tf.nn.tanh(prediction_g)
-    #predictions = tf.nn.tanh(predictions)
-    predictions = (tf.nn.tanh(predictions))**2
-    #predictions = predictions * tf.nn.relu(predictions)
-    #predictions = (predictions)**2  #
-    #predictions = predictions * tf.nn.leaky_relu(predictions,alpha=0.1)
-
-
-    predictions_all = [predictions,prediction_g]
+    predictions_all = [predictions, prediction_g]
     model = tf.keras.Model(inputs=inputs, outputs=predictions_all)
     return model
 
@@ -660,6 +691,15 @@ def new_neural_H(layer_sizes,bc_values,r_lim,theta_lim):
     return model
 
 class Coslayer_normalization(layers.Layer):
+    """
+    Fourier feature encoding layer with two modes:
+
+    - "simple" (original TF):  tanh(kernel_R * R_norm + kernel_theta * cos(pi*theta_norm + phi) + bias)
+    - "mlp" (PyTorch-style):   Separate R / theta MLP pathways before fusion:
+         theta:  cos(pi*theta_norm + phi)  ->  FC(units)->SiLU -> FC(half)->SiLU -> theta_feat
+         R:      R_norm                     ->  FC(units)->SiLU -> FC(half)->SiLU -> R_feat
+         output: concat(theta_feat, R_feat) -> activation
+    """
 
     def __init__(self,
                  units,
@@ -669,12 +709,12 @@ class Coslayer_normalization(layers.Layer):
                  use_bias=True,
                  kernel_initializer='glorot_uniform',
                  bias_initializer='zeros',
-
                  kernel_regularizer=None,
                  bias_regularizer=None,
                  activity_regularizer=None,
                  kernel_constraint=None,
                  bias_constraint=None,
+                 coslayer_mode="simple",
                  **kwargs):
         super(Coslayer_normalization, self).__init__(
             activity_regularizer=activity_regularizer, **kwargs)
@@ -694,7 +734,7 @@ class Coslayer_normalization(layers.Layer):
         self.bias_constraint = constraints.get(bias_constraint)
         self.r_lim = r_lim
         self.theta_lim = theta_lim
-        #self.K_initializer = initializers.get(K_initializer)
+        self.coslayer_mode = coslayer_mode
 
         self.kernel_one_zero = np.zeros((2, 1))
         self.kernel_zero_one = np.zeros((2, 1))
@@ -715,81 +755,120 @@ class Coslayer_normalization(layers.Layer):
             raise ValueError('The last dimension of the inputs to `Dense` '
                              'should be defined. Found `None`.')
 
-        self.kernel = self.add_weight(
-            'kernel_cos',
-            shape=[last_dim, self.units],
-            initializer=self.kernel_initializer,
-            regularizer=self.kernel_regularizer,
-            constraint=self.kernel_constraint,
-            dtype=self.dtype,
-            trainable=True)
+        if self.coslayer_mode == "mlp":
+            # ---- MLP mode: separate R/theta pathways ----
+            half = self.units // 2
 
-        self.K = tf.constant(np.pi,
-            shape=[1, ],
-            dtype=self.dtype)#2*
-
-        self.phy = self.add_weight(
-            'phy_cos',
-            shape=[self.units, ],
-            initializer=self.kernel_initializer,
-            regularizer=self.kernel_regularizer,
-            constraint=self.kernel_constraint,
-            dtype=self.dtype,
-            trainable=True)
-
-
-
-        if self.use_bias:
-            self.bias = self.add_weight(
-                'bias_cos',
+            # Fourier phase (shared)
+            self.phy = self.add_weight(
+                'phy_cos',
                 shape=[self.units, ],
-                initializer=self.bias_initializer,
-                regularizer=self.bias_regularizer,
-                constraint=self.bias_constraint,
+                initializer=self.kernel_initializer,
+                regularizer=self.kernel_regularizer,
+                constraint=self.kernel_constraint,
                 dtype=self.dtype,
                 trainable=True)
+
+            self.K_const = tf.constant(np.pi, shape=[1, ], dtype=self.dtype)
+
+            # theta pathway:  units -> units -> half
+            self.theta_fc1 = layers.Dense(self.units, activation=tf.nn.silu,
+                                          kernel_initializer="glorot_normal",
+                                          name='theta_fc1')
+            self.theta_fc2 = layers.Dense(half, activation=tf.nn.silu,
+                                          kernel_initializer="glorot_normal",
+                                          name='theta_fc2')
+
+            # R pathway:  1 -> units -> half
+            self.r_fc1 = layers.Dense(self.units, activation=tf.nn.silu,
+                                      kernel_initializer="glorot_normal",
+                                      name='r_fc1')
+            self.r_fc2 = layers.Dense(half, activation=tf.nn.silu,
+                                      kernel_initializer="glorot_normal",
+                                      name='r_fc2')
         else:
-            self.bias = None
+            # ---- Simple mode: original linear combination ----
+            self.kernel = self.add_weight(
+                'kernel_cos',
+                shape=[last_dim, self.units],
+                initializer=self.kernel_initializer,
+                regularizer=self.kernel_regularizer,
+                constraint=self.kernel_constraint,
+                dtype=self.dtype,
+                trainable=True)
+
+            self.K_const = tf.constant(np.pi, shape=[1, ], dtype=self.dtype)
+
+            self.phy = self.add_weight(
+                'phy_cos',
+                shape=[self.units, ],
+                initializer=self.kernel_initializer,
+                regularizer=self.kernel_regularizer,
+                constraint=self.kernel_constraint,
+                dtype=self.dtype,
+                trainable=True)
+
+            if self.use_bias:
+                self.bias = self.add_weight(
+                    'bias_cos',
+                    shape=[self.units, ],
+                    initializer=self.bias_initializer,
+                    regularizer=self.bias_regularizer,
+                    constraint=self.bias_constraint,
+                    dtype=self.dtype,
+                    trainable=True)
+            else:
+                self.bias = None
+
         self.built = True
 
     def call(self, inputs):
         if inputs.dtype.base_dtype != self._compute_dtype_object.base_dtype:
             inputs = math_ops.cast(inputs, dtype=self._compute_dtype_object)
 
-        '''kernel_one_zero = np.zeros((2, 1))
-        kernel_zero_one = np.zeros((2, 1))
-        kernel_one_zero[0, :] = 1.0
-        kernel_zero_one[1, :] = 1.0'''
-
-        inputs_r = tf.matmul(inputs, self.kernel_one_zero)  # 这就是所有的1#r [n,1]
-        inputs_theta = tf.matmul(inputs, self.kernel_zero_one)  # 这就是所有的2#theta [n,1]
-        ########temp############
+        inputs_r = tf.matmul(inputs, self.kernel_one_zero)   # [N, 1]
+        inputs_theta = tf.matmul(inputs, self.kernel_zero_one)  # [N, 1]
 
         inputs_R = 2.0 * (inputs_r - self.r_lim[0]) / (self.r_lim[1] - self.r_lim[0]) - 1.0
         inputs_Theta = 2.0 * (inputs_theta - self.theta_lim[0]) / (self.theta_lim[1] - self.theta_lim[0]) - 1.0
 
-        outputs = inputs_Theta * self.K  # gen_math_ops.MatMul, [n,1]*[1]
-        outputs = tf.add(outputs, self.phy)  # nn_ops.bias_add(outputs, self.phy) [n,1]+[m]=[n,m]
-        outputs = tf.cos(outputs) #[n,m]
-        ########temp############
+        if self.coslayer_mode == "mlp":
+            # ---- MLP mode ----
+            # theta pathway: Fourier -> MLP
+            theta_fourier = tf.cos(inputs_Theta * self.K_const + self.phy)  # [N, units]
+            theta_feat = self.theta_fc1(theta_fourier)                       # [N, units]
+            theta_feat = self.theta_fc2(theta_feat)                          # [N, half]
 
-        #outputs = tf.stack([inputs_r,outputs],axis=1)
-        #outputs = outputs[:,:,0]
-        #self.kernel [2,m]
-        kernel_1 = self.kernel[0, :]#[1,m]
-        kernel_2 = self.kernel[1, :]
+            # R pathway: raw coordinate -> MLP
+            r_feat = self.r_fc1(inputs_R)                                     # [N, units]
+            r_feat = self.r_fc2(r_feat)                                       # [N, half]
 
-        outputs_2 = tf.multiply(outputs, kernel_2) #[n,m] [1,m] =  [n,m]# gen_math_ops.MatMul(a=outputs, b=self.kernel)
-        inputs_r = tf.add(inputs_R, 0*self.phy) #[n,m]
-        outputs_1 = tf.multiply(inputs_R, kernel_1) #[n,1] [1,m] =  [n,m]
-        #正常情况下：[n,2]*[2,m]=[n,m]
-        outputs = tf.add(outputs_1, outputs_2)
-        if self.use_bias:
-            outputs = tf.add(outputs, self.bias)
+            # Merge
+            outputs = tf.concat([theta_feat, r_feat], axis=1)                 # [N, units]
 
-        if self.activation is not None:
-            outputs = self.activation(outputs)
-        return outputs,inputs_R
+            if self.activation is not None:
+                outputs = self.activation(outputs)
+        else:
+            # ---- Simple mode: original linear combination ----
+            outputs = inputs_Theta * self.K_const                        # [N, 1]
+            outputs = tf.add(outputs, self.phy)                          # [N, units]
+            outputs = tf.cos(outputs)                                     # [N, units]
+
+            kernel_1 = self.kernel[0, :]   # [units]
+            kernel_2 = self.kernel[1, :]   # [units]
+
+            outputs_2 = tf.multiply(outputs, kernel_2)                   # [N, units]
+            inputs_r_broadcast = tf.add(inputs_R, 0 * self.phy)          # [N, units]
+            outputs_1 = tf.multiply(inputs_r_broadcast, kernel_1)        # [N, units]
+            outputs = tf.add(outputs_1, outputs_2)
+
+            if self.use_bias:
+                outputs = tf.add(outputs, self.bias)
+
+            if self.activation is not None:
+                outputs = self.activation(outputs)
+
+        return outputs, inputs_R
 
     def compute_output_shape(self, input_shape):
         input_shape = tensor_shape.TensorShape(input_shape)
@@ -869,3 +948,286 @@ class Out_Imp_BC_value_layer(layers.Layer):
         return input_shape
 
 
+# =============================================================================
+# KANLinear - Kolmogorov-Arnold Network Layer (TF)
+# =============================================================================
+class KANLinear(layers.Layer):
+    """
+    KAN (Kolmogorov-Arnold Network) linear layer.
+
+    Replaces standard Dense(weight x + bias) with learnable B-spline
+    activation functions on each edge:
+
+        y_j = sum_i [ w_b_ij * silu(x_i) + w_s_ij * sum_k c_ijk * B_k(x_i) ]
+
+    where B_k are B-spline basis functions of order `spline_order` on a
+    uniform grid of `grid_size` intervals over `grid_range`.
+
+    Based on the efficient-KAN formulation (arXiv:2403.07288).
+    """
+
+    def __init__(self, units, grid_size=5, spline_order=3,
+                 grid_range=(-1, 1), activation=None,
+                 kernel_initializer='glorot_uniform', **kwargs):
+        super(KANLinear, self).__init__(**kwargs)
+
+        self.units = units
+        self.grid_size = grid_size
+        self.spline_order = spline_order
+        self.grid_range = grid_range
+        self.activation = activations.get(activation)
+
+        # Build uniform grid with K extra points on each side
+        h = (grid_range[1] - grid_range[0]) / grid_size
+        n_total = grid_size + 2 * spline_order + 1
+        grid_np = np.linspace(
+            grid_range[0] - h * spline_order,
+            grid_range[1] + h * spline_order,
+            n_total
+        ).astype(np.float32)
+
+        self.grid = self.add_weight(
+            name='grid',
+            shape=(n_total,),
+            initializer=tf.constant_initializer(grid_np),
+            trainable=False
+        )
+        self.kernel_initializer = initializers.get(kernel_initializer)
+
+    def build(self, input_shape):
+        last_dim = tensor_shape.dimension_value(input_shape[-1])
+        if last_dim is None:
+            raise ValueError('The last dimension of inputs should be defined.')
+
+        # Base weight
+        self.base_weight = self.add_weight(
+            name='base_weight',
+            shape=(last_dim, self.units),
+            initializer=self.kernel_initializer,
+            trainable=True
+        )
+
+        # Spline scale weight
+        self.spline_weight = self.add_weight(
+            name='spline_weight',
+            shape=(last_dim, self.units),
+            initializer=tf.random_normal_initializer(mean=0.0, stddev=0.1),
+            trainable=True
+        )
+
+        # Spline coefficients
+        self.spline_coeffs = self.add_weight(
+            name='spline_coeffs',
+            shape=(last_dim, self.units, self.grid_size + self.spline_order),
+            initializer=self.kernel_initializer,
+            trainable=True
+        )
+
+        self.built = True
+
+    def _b_spline_basis(self, x):
+        """
+        Compute B-spline basis functions via Cox-de Boor recurrence.
+
+        Args:
+            x: [batch, in_features] in grid_range
+        Returns:
+            basis: [batch, in_features, grid_size + spline_order]
+        """
+        grid = self.grid  # [n_total]
+        k = self.spline_order
+
+        x = tf.expand_dims(x, axis=-1)  # [batch, in, 1]
+
+        # Order-0 basis: N_{i,0}(x) = 1 if t_i <= x < t_{i+1} else 0
+        left = grid[:-1]
+        right = grid[1:]
+
+        left_b = tf.reshape(left, [1, 1, -1])
+        right_b = tf.reshape(right, [1, 1, -1])
+
+        bases = tf.cast((x >= left_b) & (x < right_b), tf.float32)
+
+        # Handle x == grid[-1]: assign to the last basis
+        rightmost = tf.cast(tf.squeeze(x, axis=-1) >= grid[-1], tf.float32)
+        last_idx = bases.shape[-1] - 1
+        bases = bases + tf.pad(
+            tf.expand_dims(rightmost, -1),
+            [[0, 0], [0, 0], [last_idx, 0]]
+        )
+
+        # Cox-de Boor recurrence for orders 1..K
+        for order in range(1, k + 1):
+            n_current = bases.shape[-1]
+
+            t_i   = grid[:n_current - 1]
+            t_ik  = grid[order:order + n_current - 1]
+            t_ik1 = grid[order + 1:order + n_current]
+            t_i1  = grid[1:n_current]
+
+            t_i_b   = tf.reshape(t_i,   [1, 1, -1])
+            t_ik_b  = tf.reshape(t_ik,  [1, 1, -1])
+            t_ik1_b = tf.reshape(t_ik1, [1, 1, -1])
+            t_i1_b  = tf.reshape(t_i1,  [1, 1, -1])
+
+            alpha = (x - t_i_b) / (t_ik_b - t_i_b + 1e-12)
+            beta  = (t_ik1_b - x) / (t_ik1_b - t_i1_b + 1e-12)
+
+            alpha = tf.clip_by_value(alpha, 0.0, 1.0)
+            beta  = tf.clip_by_value(beta, 0.0, 1.0)
+
+            bases = alpha * bases[:, :, :-1] + beta * bases[:, :, 1:]
+
+        return bases
+
+    def call(self, x):
+        # Base path: silu + linear
+        base = tf.matmul(tf.nn.silu(x), self.base_weight)  # [batch, out_units]
+
+        # Spline path
+        basis = self._b_spline_basis(x)  # [batch, in_features, G+K]
+
+        # Scale coefficients by per-edge weight: [in_features, out_units, G+K]
+        coeffs_scaled = (self.spline_coeffs
+                         * tf.expand_dims(self.spline_weight, -1))
+
+        # Einsum contraction: sum over in_features and basis functions → [batch, out_units]
+        spline = tf.einsum('bik,iok->bo', basis, coeffs_scaled)
+
+        result = base + spline
+
+        if self.activation is not None:
+            result = self.activation(result)
+        return result
+
+
+# =============================================================================
+# PIKAN_Polar_BC_Two_Output - KAN-based PINN
+# =============================================================================
+def PIKAN_Polar_BC_Two_Output(layer_sizes, bc_values, r_lim, theta_lim,
+                               kan_grid_size=5, kan_spline_order=3,
+                               output_head_dim=64, use_residual=False,
+                               coslayer_mode="simple"):
+    """
+    PIKAN architecture for Reynolds equation with JFO cavitation.
+    ...
+    Args:
+        ...
+        coslayer_mode: "simple" (original linear mix) or "mlp" (separate R/θ MLP pathways)
+    """
+    act_fn = tf.nn.silu  # KAN naturally uses SiLU in both base and U/V paths
+
+    inputs = tf.keras.Input(shape=(2,))
+
+    # ---- 1. Fourier feature encoding ----
+    cos_units = layer_sizes[1]
+    x, inputs_R = Coslayer_normalization(
+        cos_units, r_lim, theta_lim,
+        activation=tf.nn.tanh,
+        kernel_initializer="glorot_normal",
+        bias_initializer=tf.constant_initializer(0),
+        coslayer_mode=coslayer_mode
+    )(inputs)
+
+    hidden_w = list(layer_sizes[2:-1])
+    base_width = hidden_w[0]
+    last_dim = hidden_w[-1]
+
+    # ---- 2. KAN U / V base branches ----
+    x_U = KANLinear(base_width, grid_size=kan_grid_size,
+                    spline_order=kan_spline_order)(x)
+    x_V = KANLinear(base_width, grid_size=kan_grid_size,
+                    spline_order=kan_spline_order)(x)
+
+    # ---- 3. KAN Hermite interpolation branches ----
+    x_1 = KANLinear(1, grid_size=kan_grid_size,
+                    spline_order=kan_spline_order,
+                    activation=tf.nn.tanh)(x)
+    x_2 = KANLinear(1, grid_size=kan_grid_size,
+                    spline_order=kan_spline_order,
+                    activation=tf.nn.tanh)(x)
+
+    # ---- 4. KAN gated hidden layers ----
+    prev = None
+
+    for i, w in enumerate(hidden_w):
+        # Gate from current features
+        x_t = KANLinear(w, grid_size=kan_grid_size,
+                        spline_order=kan_spline_order,
+                        activation=tf.nn.tanh)(x)
+
+        # U / V at current width
+        if w == base_width:
+            U_w, V_w = x_U, x_V
+        else:
+            U_w = KANLinear(w, grid_size=kan_grid_size,
+                            spline_order=kan_spline_order)(x_U)
+            V_w = KANLinear(w, grid_size=kan_grid_size,
+                            spline_order=kan_spline_order)(x_V)
+
+        main = x_t * U_w + (1.0 - x_t) * V_w
+
+        # Residual skip
+        if prev is not None and use_residual:
+            if prev.shape[-1] != w:
+                skip = layers.Dense(w, activation=None, kernel_initializer="glorot_normal")(prev)
+            else:
+                skip = prev
+            main = main + skip
+
+        prev = main
+        x = main
+
+    # ---- 5. Deep Output Heads ----
+    H = output_head_dim
+
+    # Pressure head
+    p_h1 = layers.Dense(H, activation=act_fn, kernel_initializer="glorot_normal")(x)
+    p_h2 = layers.Dense(H, activation=act_fn, kernel_initializer="glorot_normal")(p_h1)
+    if use_residual:
+        p_h2 = p_h2 + p_h1
+    p_raw = layers.Dense(1, activation=None, use_bias=True,
+                         bias_initializer=tf.constant_initializer(0),
+                         kernel_initializer="glorot_normal")(p_h2)
+
+    # Gamma head
+    g_h1 = layers.Dense(H, activation=act_fn, kernel_initializer="glorot_normal")(x)
+    g_h2 = layers.Dense(H, activation=act_fn, kernel_initializer="glorot_normal")(g_h1)
+    if use_residual:
+        g_h2 = g_h2 + g_h1
+
+    g_cat = tf.concat([p_h2, g_h2], axis=1)
+    g_cat1 = layers.Dense(H, activation=act_fn, kernel_initializer="glorot_normal")(g_cat)
+    g_cat2 = layers.Dense(H, activation=act_fn, kernel_initializer="glorot_normal")(g_cat1)
+    if use_residual:
+        g_cat2 = g_cat2 + g_cat1
+    g_raw = layers.Dense(1, activation=None, use_bias=True,
+                         bias_initializer=tf.constant_initializer(0),
+                         kernel_initializer=tf.constant_initializer(1e-6))(g_cat2)
+
+    # ---- 6. BC Enforcement ----
+    sigma_func_1 = Out_Imp_BC_layer(para_exp_BC_initializer=tf.constant_initializer(1.))(inputs_R)
+    sigma_func_2 = Out_Imp_BC_layer(para_exp_BC_initializer=tf.constant_initializer(1.))(inputs_R)
+
+    # g_func_1: atanh interpolation of sqrt(bc) matching boundary values
+    g_func_1 = tf.math.atanh(
+        (tf.math.sqrt(bc_values[1]) - tf.math.sqrt(bc_values[0])) / 2.0 * (inputs_R + 1.0)
+        + tf.math.sqrt(bc_values[0])
+    )
+
+    # g_func_2: 2-point cubic Hermite interpolation
+    g_func_2 = (x_1 * (inputs_R + 1.0) * ((inputs_R - 1.0) / (-2.0)) ** 2
+                + x_2 * (inputs_R - 1.0) * ((inputs_R + 1.0) / 2.0) ** 2)
+
+    g_func = g_func_1 + g_func_2
+
+    predictions = g_func + sigma_func_1 * p_raw
+    prediction_g = sigma_func_2 * g_raw
+
+    # Non-negative outputs via tanh^2
+    predictions = tf.nn.tanh(predictions) ** 2
+    prediction_g = tf.nn.tanh(prediction_g) ** 2
+
+    predictions_all = [predictions, prediction_g]
+    model = tf.keras.Model(inputs=inputs, outputs=predictions_all)
+    return model
