@@ -109,7 +109,7 @@ class Config:
 
     # 硬件 / 输出
     output_dir = "output_tf"  # 输出目录
-    device = "0"              # GPU设备ID, "-1"=自动选择, "cpu"=仅CPU
+    device = "1"              # GPU设备ID, "-1"=自动选择, "cpu"=仅CPU
 
     # 绘图参数
     dpi_save = 600

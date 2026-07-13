@@ -292,28 +292,29 @@ class GradientAnalyzer:
 
     def _compute_per_layer_grads_multi_sample(self, loss_fn, n_samples=5, n_points=1024):
         """
-        多次随机采样 minibatch，计算各参数梯度的 均值/标准差。
+        通过执行单步训练并测量 weight delta 来估计各参数的有效梯度。
 
-        Args:
-            loss_fn: callable(X_sample) → loss 标量
-            n_samples: 采样次数
-            n_points: 每次采样的配点数
-
-        Returns:
-            dict: var_name → {grad_L2_mean, grad_L2_std, CV, grad_L2_samples[], ...}
+        原理：不直接使用 GradientTape（避免 eager/graph 模式混合导致 NaN），
+        而是保存权重 → 跑一步完整训练（fit内部用 tf.function 正确计算梯度）
+        → 测量权重变化 → 恢复权重。
+        delta_W ≈ -lr × grad，所以 ||delta_W|| ∝ ||grad||。
         """
         original_X_f = self.model.domain.X_f
         original_X_f_in = self.model.X_f_in
         X_f_all = original_X_f
         n_total = len(X_f_all)
 
-        # 收集每次采样的梯度
-        all_sample_grads = []  # [{var_name: grad_norm}, ...]
+        # 收集每次采样的结果
+        all_sample_deltas = []
 
         for si in range(n_samples):
             n_use = min(n_points, n_total)
             idx = np.random.choice(n_total, n_use, replace=False)
             X_sample = X_f_all[idx]
+
+            # 保存权重
+            saved_weights = [v.numpy().copy()
+                             for v in self.model.u_model.trainable_variables]
 
             # 临时替换配点
             self.model.domain.X_f = X_sample
@@ -322,61 +323,65 @@ class GradientAnalyzer:
                 for i, vec in enumerate(X_sample.T)
             ]
 
-            with tf.GradientTape() as tape:
-                loss = loss_fn()
-                if isinstance(loss, (list, tuple)):
-                    loss = loss[0]
+            # 跑一步训练（内部用 tf.function 正确计算并应用梯度）
+            self.model.fit(tf_iter=1, newton_iter=0, batch_sz=n_use)
 
-            trainable_vars = self.model.u_model.trainable_variables
-            grads = tape.gradient(loss, trainable_vars)
-
+            # 测量 weight delta
             sample_result = {}
-            for var, grad in zip(trainable_vars, grads):
+            for var, saved in zip(self.model.u_model.trainable_variables,
+                                  saved_weights):
                 name = self._to_var_name(var)
-                g_l2 = _grad_norm(grad)
-                p_l2 = float(tf.sqrt(tf.reduce_sum(var ** 2)).numpy())
+                current = var.numpy()
+                delta_L2 = float(np.sqrt(np.sum((current - saved) ** 2)))
+                param_L2 = float(np.sqrt(np.sum(saved ** 2)))
                 sample_result[name] = {
-                    "grad_L2": g_l2,
-                    "param_L2": p_l2,
+                    "delta_L2": delta_L2,     # ||W_new - W_old|| ∝ ||grad||
+                    "param_L2": param_L2,
                 }
-            all_sample_grads.append(sample_result)
+
+            all_sample_deltas.append(sample_result)
+
+            # 恢复权重
+            for var, saved in zip(self.model.u_model.trainable_variables,
+                                  saved_weights):
+                var.assign(saved)
 
         # 恢复原始配点
         self.model.domain.X_f = original_X_f
         self.model.X_f_in = original_X_f_in
 
-        # 汇总统计
-        var_names = list(all_sample_grads[0].keys())
+        # 汇总统计：用 delta_L2 作为 grad_L2 的代理
+        var_names = list(all_sample_deltas[0].keys())
         results = {}
         for name in var_names:
-            g_l2s = [s[name]["grad_L2"] for s in all_sample_grads]
-            p_l2  = all_sample_grads[0][name]["param_L2"]
-            g_mean = float(np.mean(g_l2s))
-            g_std  = float(np.std(g_l2s))
-            cv     = g_std / (g_mean + 1e-20)  # 变异系数
-            # 查找参数数量
-            p_count = 0
-            for v in self.model.u_model.trainable_variables:
-                if self._to_var_name(v) == name:
-                    p_count = int(tf.reduce_sum(v * 0 + 1).numpy())
-                    break
-
+            deltas = [s[name]["delta_L2"] for s in all_sample_deltas]
+            p_l2   = all_sample_deltas[0][name]["param_L2"]
+            d_mean = float(np.mean(deltas))
+            d_std  = float(np.std(deltas))
+            cv     = d_std / (d_mean + 1e-20)
             results[name] = {
-                "grad_L2_mean":   g_mean,
-                "grad_L2_std":    g_std,
-                "grad_L2_min":    float(np.min(g_l2s)),
-                "grad_L2_max":    float(np.max(g_l2s)),
-                "grad_L2_samples": [float(v) for v in g_l2s],
+                "grad_L2_mean":   d_mean,      # 实际是 ||ΔW||_2，与 ||grad|| 成正比
+                "grad_L2_std":    d_std,
+                "grad_L2_min":    float(np.min(deltas)),
+                "grad_L2_max":    float(np.max(deltas)),
+                "grad_L2_samples": [float(v) for v in deltas],
                 "CV":             float(cv),
                 "is_noisy":       bool(cv > 1.0),
-                "is_vanishing":   bool(g_mean < 1e-8),
-                "is_exploding":   bool(g_mean > 1e8),
+                "is_vanishing":   bool(d_mean < 1e-12),
+                "is_exploding":   bool(d_mean > 1e3),
                 "param_L2":       float(p_l2),
-                "eff_update_mean": float(g_mean / (p_l2 + 1e-16)),
-                "param_count":    p_count,
+                "eff_update_mean": float(d_mean / (p_l2 + 1e-16)),
+                "param_count":    self._get_param_count(name),
             }
 
         return results
+
+    def _get_param_count(self, name):
+        """根据名称查找参数的元素数量。"""
+        for v in self.model.u_model.trainable_variables:
+            if self._to_var_name(v) == name:
+                return int(tf.reduce_sum(v * 0 + 1).numpy())
+        return 0
 
     def _compute_layer_grad_ratio(self, grad_stats):
         """
@@ -393,8 +398,9 @@ class GradientAnalyzer:
         ratio = max_val / (min_val + 1e-20)
 
         max_name = max(grad_stats.items(), key=lambda x: x[1]["grad_L2_mean"])[0]
-        min_name = min(grad_stats.items(), key=lambda x: x[1]["grad_L2_mean"]
-                       if x[1]["grad_L2_mean"] > 1e-20 else (float('inf'),))[0]
+        min_name = min(grad_stats.items(),
+                       key=lambda x: x[1]["grad_L2_mean"]
+                       if x[1]["grad_L2_mean"] > 1e-20 else float('inf'))[0]
 
         return {
             "max_min_ratio": float(ratio),
@@ -435,22 +441,21 @@ class GradientAnalyzer:
         self.prev_weights = current
         return changes
 
-    def snapshot(self, loss_fn, n_samples=5, stage_label="", include_change=True):
+    def snapshot(self, n_samples=5, stage_label="", include_change=True):
         """
         拍一张详细的梯度快照。
 
         Args:
-            loss_fn: callable → loss
-            n_samples: 梯度采样次数 (越多越准确)
+            n_samples: 采样次数 (越多越准确)
             stage_label: 阶段标签 e.g. "Stage1_Round2"
             include_change: 是否计算参数变化
 
         Returns:
-            dict: 包含多采样梯度统计 + 稳定性指标 + 参数变化
+            dict: 包含多采样权重变化统计 + 稳定性指标 + 参数变化
         """
-        # 多采样梯度
+        # 多采样梯度（通过 weight delta 估计）
         grad_stats = self._compute_per_layer_grads_multi_sample(
-            loss_fn, n_samples=n_samples
+            None, n_samples=n_samples
         )
 
         # 层间梯度比
@@ -493,12 +498,8 @@ class GradientAnalyzer:
         """
         在阶段/轮次边界拍快照，记录阶段信息。
         """
-        def loss_fn():
-            loss_all = self.model.update_loss_seperate()
-            return sum(loss_all)
-
         label = f"S{stage_idx+1}_R{round_idx+1}_E{global_epoch}"
-        result = self.snapshot(loss_fn, n_samples=8, stage_label=label)
+        result = self.snapshot(n_samples=8, stage_label=label)
         result["stage_idx"] = stage_idx
         result["round_idx"] = round_idx
         result["global_epoch"] = global_epoch
@@ -665,10 +666,7 @@ class TrainingDiagnostics:
 
         # --- 3. 梯度分析 ---
         print("  [3/4] Gradient analysis ...")
-        def loss_fn():
-            loss_all = self.model.update_loss_seperate()
-            return sum(loss_all)
-        snap["grad_analysis"] = self.grad_analyzer.snapshot(loss_fn)
+        snap["grad_analysis"] = self.grad_analyzer.snapshot(n_samples=3)
 
         # --- 4. 损失值 ---
         print("  [4/4] Loss values ...")
