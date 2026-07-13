@@ -107,6 +107,11 @@ class ReynoldsTermAnalyzer:
 
     def decompose(self, u_model, R, theta):
         """将残差分解为五项，返回 dict。"""
+        return self._decompose_graph(u_model, R, theta)
+
+    @tf.function
+    def _decompose_graph(self, u_model, R, theta):
+        """tf.function 包裹的分解，支持 tf.gradients。"""
         p_vector = u_model(tf.concat([R, theta], 1))
         p, gamma = p_vector[0], p_vector[1]
         H = self.H_func(R, theta)
@@ -132,15 +137,15 @@ class ReynoldsTermAnalyzer:
         f_p   = part_1 + part_2 + part_3_1 + part_3_2 + stab
 
         return {
-            "part_1":   _to_numpy(part_1),
-            "part_2":   _to_numpy(part_2),
-            "part_3_1": _to_numpy(part_3_1),
-            "part_3_2": _to_numpy(part_3_2),
-            "stab":     _to_numpy(stab),
-            "f_p":      _to_numpy(f_p),
-            "p":        _to_numpy(p),
-            "gamma":    _to_numpy(gamma),
-            "H":        _to_numpy(H),
+            "part_1":   part_1,
+            "part_2":   part_2,
+            "part_3_1": part_3_1,
+            "part_3_2": part_3_2,
+            "stab":     stab,
+            "f_p":      f_p,
+            "p":        p,
+            "gamma":    gamma,
+            "H":        H,
         }
 
     def analyze(self, u_model, X_f):
@@ -254,9 +259,9 @@ class LayerStatsCollector:
 
     def full_analysis(self, X_sample):
         """同时分析权重和激活值。"""
-        print("  [LayerStats] Analyzing weight distributions...")
+        # Analyzing weight distributions...
         w_stats = self._get_layer_weights_stats()
-        print("  [LayerStats] Analyzing activation distributions...")
+        # Analyzing activation distributions...
         a_stats = self.analyze_activations(X_sample)
         return {"weights": w_stats, "activations": a_stats}
 
@@ -631,23 +636,12 @@ class TrainingDiagnostics:
         self.stage_boundaries = []  # 阶段边界的详细梯度快照
 
     def snapshot(self, epoch):
-        """
-        拍一张训练中间快照。
-        包含: PDE项统计 + 输出分布 + 梯度分析 + 损失值
-        """
-        print(f"\n{'='*60}")
-        print(f"[Diagnostics] Snapshot at epoch {epoch}")
-        print(f"{'='*60}")
-
+        """训练中间快照：仅写文件，不输出到控制台。"""
         snap = {"epoch": epoch}
         X_f = self.model.domain.X_f
 
-        # --- 1. PDE 逐项统计 ---
-        print("  [1/4] PDE term decomposition ...")
         snap["pde_terms"] = self.pde_analyzer.analyze(self.model.u_model, X_f)
 
-        # --- 2. 输出头 (P/γ) 分布 ---
-        print("  [2/4] Output distribution ...")
         R_tf     = tf.constant(X_f[:, 0:1], dtype=tf.float32)
         theta_tf = tf.constant(X_f[:, 1:2], dtype=tf.float32)
         u_preds  = self.model.u_model(tf.concat([R_tf, theta_tf], 1))
@@ -659,19 +653,14 @@ class TrainingDiagnostics:
         snap["output_p_hist"] = _hist_counts(p_val)
         snap["output_g_hist"] = _hist_counts(g_val)
 
-        # FB 互补条件: p + γ - sqrt(p²+γ²)
         fb_val = p_val + g_val - np.sqrt(p_val**2 + g_val**2)
         snap["fb_complement"] = _stats(fb_val, name="FB(p,g)")
         snap["fb_complement_hist"] = _hist_counts(fb_val)
 
-        # --- 3. 跳过的梯度分析（训练后用 diagnose_post.py 离线做） ---
         snap["grad_analysis"] = {"note": "gradient analysis skipped during training, run diagnose_post.py for offline analysis"}
 
-        # --- 4. 损失值 ---
-        print("  [4/4] Loss values ...")
         loss_all = self.model.update_loss_seperate()
         loss_names = ['L_Reynolds', 'L_FB', 'L_BC_gamma']
-        # 实际 loss_all 结构: Reynolds is index 0 (single element list), BC at 1, FB at 2
         for i, loss_val in enumerate(loss_all):
             name = loss_names[i] if i < len(loss_names) else f"loss_{i}"
             snap[f"loss_{name}"] = float(_to_numpy(loss_val))
@@ -679,10 +668,8 @@ class TrainingDiagnostics:
         self.snapshots.append(snap)
         self.epochs.append(epoch)
 
-        # 保存当前快照
         snap_path = os.path.join(self.out_dir, f"snapshot_epoch_{epoch:06d}.json")
         self._save_snapshot_json(snap, snap_path)
-        print(f"  Snapshot saved → {snap_path}")
 
     def _save_snapshot_json(self, snap, path):
         """保存快照为 JSON (hist 和大型数组写入单独的 .npz)。"""
@@ -725,15 +712,7 @@ class TrainingDiagnostics:
             np.savez_compressed(npz_path, **npz_data)
 
     def stage_boundary_snapshot(self, stage_idx, round_idx, global_epoch):
-        """
-        阶段/轮次边界的轻量快照。只做前向诊断（PDE + 输出 + Loss）。
-        不调用 fit()，梯度分析留给训练后的 diagnose_post.py 离线完成。
-        """
-        print(f"\n{'='*60}")
-        print(f"[Diagnostics] Stage Boundary Snapshot: "
-              f"Stage {stage_idx+1}, Round {round_idx+1}, Epoch {global_epoch}")
-        print(f"{'='*60}")
-
+        """阶段/轮次边界的轻量快照，仅写文件不输出控制台。"""
         label = f"S{stage_idx+1}_R{round_idx+1}_E{global_epoch}"
         snap = {
             "stage_label": label,
@@ -744,12 +723,8 @@ class TrainingDiagnostics:
 
         X_f = self.model.domain.X_f
 
-        # --- 1. PDE 逐项统计 ---
-        print("  [1/3] PDE term decomposition ...")
         snap["pde_terms"] = self.pde_analyzer.analyze(self.model.u_model, X_f)
 
-        # --- 2. 输出分布 + FB 互补 ---
-        print("  [2/3] Output distribution ...")
         R_tf = tf.constant(X_f[:, 0:1], dtype=tf.float32)
         theta_tf = tf.constant(X_f[:, 1:2], dtype=tf.float32)
         u_preds = self.model.u_model(tf.concat([R_tf, theta_tf], 1))
@@ -761,8 +736,6 @@ class TrainingDiagnostics:
         fb_val = p_val + g_val - np.sqrt(p_val**2 + g_val**2)
         snap["fb_complement"] = _stats(fb_val, name="FB")
 
-        # --- 3. 损失值 ---
-        print("  [3/3] Loss values ...")
         loss_all = self.model.update_loss_seperate()
         loss_names = ['L_Reynolds', 'L_FB', 'L_BC_gamma']
         for i, loss_val in enumerate(loss_all):
@@ -771,28 +744,11 @@ class TrainingDiagnostics:
 
         self.stage_boundaries.append(snap)
 
-        # 保存
         snap_path = os.path.join(self.out_dir, f"stage_boundary_{label}.json")
         self._save_snapshot_json(snap, snap_path)
-        print(f"  Stage boundary snapshot saved → {snap_path}")
-
-        # 打印关键指标
-        pde = snap.get("pde_terms", {})
-        print(f"  PDE Reynolds:  part_1={pde.get('part_1',{}).get('mean',0):.2e}  "
-              f"part_2={pde.get('part_2',{}).get('mean',0):.2e}  "
-              f"f_p={pde.get('f_p',{}).get('mean',0):.2e}")
-        print(f"  Output: P∈[{p_val.min():.4f},{p_val.max():.4f}]  "
-              f"γ∈[{g_val.min():.4f},{g_val.max():.4f}]  FB residual={fb_val.mean():.2e}")
-        print(f"  Loss: Reynolds={snap.get('loss_L_Reynolds', 0):.3e}  "
-              f"FB={snap.get('loss_L_FB', 0):.3e}")
 
     def finalize(self):
-        """训练结束，汇总所有快照 + 梯度稳定性分析。"""
-        print(f"\n{'='*60}")
-        print(f"[Diagnostics] Finalizing — generating summary report")
-        print(f"{'='*60}")
-
-        # 汇总各 epoch 的关键指标趋势
+        """训练结束，汇总所有快照 + 梯度稳定性分析，仅写文件。"""
         summary = {
             "epochs": self.epochs,
             "loss_Reynolds": [],
@@ -829,12 +785,10 @@ class TrainingDiagnostics:
         summary_path = os.path.join(self.out_dir, "training_summary.json")
         with open(summary_path, 'w') as f:
             json.dump(summary, f, indent=2, default=str)
-        print(f"  Summary → {summary_path}")
 
         # 生成可读文本报告
         report_path = os.path.join(self.out_dir, "diagnostic_report.txt")
         self._write_report(report_path, grad_summary)
-        print(f"  Report → {report_path}")
 
         return summary
 
@@ -1013,12 +967,7 @@ def post_training_analysis(model, params, cfg, output_dir):
     post_dir = os.path.join(diag_dir, 'post_training')
     ensure_dir(post_dir)
 
-    print(f"\n{'='*60}")
-    print("[Post-Training Analysis]")
-    print(f"{'='*60}")
-
     # PDE 项完整统计
-    print("\n[1/3] Full PDE term analysis ...")
     from reynold_pinn import create_H_func
     H_func, _ = create_H_func(params, cfg)
     pde_analyzer = ReynoldsTermAnalyzer(H_func, params, cfg)
@@ -1027,17 +976,7 @@ def post_training_analysis(model, params, cfg, output_dir):
     with open(os.path.join(post_dir, 'pde_terms_full.json'), 'w') as f:
         json.dump(pde_stats, f, indent=2, default=str)
 
-    # 打印 PDE 项摘要
-    print("  PDE Term Summary (full data):")
-    print(f"  {'Term':<12s} {'mean':>14s} {'std':>14s} {'max':>14s} {'p99':>14s}")
-    print("  " + "-" * 70)
-    for term_name in ["part_1", "part_2", "part_3_1", "part_3_2", "stab", "f_p"]:
-        t = pde_stats.get(term_name, {})
-        print(f"  {term_name:<12s} {t.get('mean',0):>14.4e} {t.get('std',0):>14.4e} "
-              f"{t.get('max',0):>14.4e} {t.get('p99',0):>14.4e}")
-
     # 逐层统计
-    print("\n[2/3] Layer-wise weight & activation analysis ...")
     layer_collector = LayerStatsCollector(model.u_model)
     # 抽样所有配点（最多 5000 点以节省内存）
     X_f = model.domain.X_f
@@ -1049,24 +988,7 @@ def post_training_analysis(model, params, cfg, output_dir):
     with open(os.path.join(post_dir, 'layer_stats.json'), 'w') as f:
         json.dump(layer_stats, f, indent=2, default=str)
 
-    # 打印权重分布摘要
-    print("\n  Weight Distribution Summary:")
-    w_stats = layer_stats.get("weights", {})
-    for name, info in sorted(w_stats.items()):
-        if not name.endswith('_hist'):
-            print(f"    {name:<50s}  mean={info.get('mean',0):>12.6e}  "
-                  f"std={info.get('std',0):>12.6e}  range=[{info.get('min',0):>12.6e}, {info.get('max',0):>12.6e}]")
-
-    # 激活值分布摘要
-    print("\n  Activation Distribution Summary:")
-    a_stats = layer_stats.get("activations", {})
-    for name, info in sorted(a_stats.items()):
-        if not name.endswith('_hist'):
-            print(f"    {name:<50s}  mean={info.get('mean',0):>12.6e}  "
-                  f"std={info.get('std',0):>12.6e}  max={info.get('max',0):>12.6e}")
-
     # 计算 FB 互补条件在全部数据上的表现
-    print("\n[3/3] JFO complementarity on full data ...")
     R_tf     = tf.constant(X_f[:, 0:1], dtype=tf.float32)
     theta_tf = tf.constant(X_f[:, 1:2], dtype=tf.float32)
     u_preds  = model.u_model(tf.concat([R_tf, theta_tf], 1))
@@ -1079,10 +1001,6 @@ def post_training_analysis(model, params, cfg, output_dir):
     pg_stats = _stats(p_mul_g, name="P_times_gamma")
     with open(os.path.join(post_dir, 'jfo_full.json'), 'w') as f:
         json.dump({"FB_complement": fb_stats, "P_times_gamma": pg_stats}, f, indent=2)
-
-    print(f"  FB complement: mean={fb_stats['mean']:.4e}  max={fb_stats['max']:.4e}  p99={fb_stats['p99']:.4e}")
-    print(f"  P × γ:         mean={pg_stats['mean']:.4e}  max={pg_stats['max']:.4e}  p99={pg_stats['p99']:.4e}")
-    print(f"\n  Results saved → {post_dir}")
 
     return pde_stats, layer_stats, fb_stats
 
@@ -1109,15 +1027,10 @@ def gradient_impact_detailed_analysis(model, params, cfg, output_dir, n_samples=
     impact_dir = os.path.join(diag_dir, 'gradient_impact')
     ensure_dir(impact_dir)
 
-    print(f"\n{'='*60}")
-    print("[Gradient Impact Detailed Analysis]")
-    print(f"{'='*60}")
-
     X_f = model.domain.X_f
 
     all_results = []
     for sample_i in range(n_samples):
-        print(f"  Sample {sample_i+1}/{n_samples} ...")
         # 随机采样
         n_use = min(len(X_f), 4096)
         idx = np.random.choice(len(X_f), n_use, replace=False)
@@ -1181,16 +1094,7 @@ def gradient_impact_detailed_analysis(model, params, cfg, output_dir, n_samples=
             {"name": n, **info} for n, info in sorted_by_impact
         ]}, f, indent=2)
 
-    # 打印摘要
-    print(f"\n  Per-component Gradient Impact (sorted by effective update):")
-    print(f"  {'Rank':<5s} {'Component':<50s} {'Grad L2':>12s} {'Param L2':>12s} {'Eff.Update':>12s} {'#Params':>8s}")
-    print("  " + "-" * 102)
-    for rank, (name, info) in enumerate(sorted_by_impact[:30], 1):
-        print(f"  {rank:<5d} {name:<50s} {info['grad_L2_mean']:>12.4e} "
-              f"{info['param_L2']:>12.4e} {info['eff_update_mean']:>12.4e} "
-              f"{info['param_count']:>8,d}")
-
-    print(f"\n  Full results → {impact_path}")
+    # 全量结果已保存到文件
 
     return merged
 
