@@ -12,6 +12,9 @@ import json
 # 获取脚本所在目录
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
+# 禁用 XLA JIT（RTX 4090 segfault 兼容性修复）
+os.environ['TF_XLA_FLAGS'] = '--tf_xla_auto_jit=0'
+
 import numpy as np
 import tensorflow as tf
 import matplotlib.ticker
@@ -109,7 +112,7 @@ class Config:
 
     # 硬件 / 输出
     output_dir = "output_tf"  # 输出目录
-    device = "1"              # GPU设备ID, "-1"=自动选择, "cpu"=仅CPU
+    device = "1"              # GPU设备ID, 例如 "0", "1", "5"
 
     # 绘图参数
     dpi_save = 600
@@ -488,31 +491,18 @@ def main():
     cfg = Config()
 
     # ---- 设备设置 ----
+    gpu_id = int(cfg.device)
     gpus = tf.config.list_physical_devices('GPU')
-    if cfg.device.lower() == "cpu":
-        tf.config.set_visible_devices([], 'GPU')
-        print(f"[Device] CPU only (available GPUs hidden: {len(gpus)})")
-    elif cfg.device in ("-1", "auto"):
-        # 自动 — 不做限制
-        if gpus:
-            for g in gpus:
-                tf.config.experimental.set_memory_growth(g, True)
-            print(f"[Device] Auto — {len(gpus)} GPU(s) visible, memory growth enabled")
-        else:
-            print("[Device] Auto — no GPU detected, using CPU")
-    else:
-        gpu_id = int(cfg.device)
-        if not gpus:
-            print(f"[Device] ERROR: Requested GPU:{gpu_id} but no GPUs detected!")
-        elif gpu_id >= len(gpus):
-            print(f"[Device] ERROR: Requested GPU:{gpu_id} but only {len(gpus)} GPU(s) available! Using GPU:0 instead.")
-            tf.config.set_visible_devices(gpus[0], 'GPU')
-        else:
-            # 两步法：先隐藏全部，再只显示目标 GPU（更可靠）
-            tf.config.set_visible_devices([], 'GPU')
-            tf.config.set_visible_devices(gpus[gpu_id], 'GPU')
-            tf.config.experimental.set_memory_growth(gpus[gpu_id], True)
-            print(f"[Device] GPU {gpu_id} selected (physical name: {gpus[gpu_id].name})")
+    if not gpus:
+        raise RuntimeError(f"[Device] 没有检测到 GPU！无法使用 GPU:{gpu_id}")
+    if gpu_id >= len(gpus):
+        print(f"[Device] 警告: 请求 GPU:{gpu_id} 但只有 {len(gpus)} 张 GPU，改用 GPU:0")
+        gpu_id = 0
+    # 两步法：先隐藏全部 GPU，再只显示目标 GPU
+    tf.config.set_visible_devices([], 'GPU')
+    tf.config.set_visible_devices(gpus[gpu_id], 'GPU')
+    tf.config.experimental.set_memory_growth(gpus[gpu_id], True)
+    print(f"[Device] GPU {gpu_id} (physical: {gpus[gpu_id].name})")
 
     # ---- 输出目录结构 (匹配 PyTorch 版) ----
     output_dir = os.path.join(SCRIPT_DIR, cfg.output_dir)
