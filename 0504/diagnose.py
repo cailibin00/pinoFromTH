@@ -499,7 +499,7 @@ class GradientAnalyzer:
         在阶段/轮次边界拍快照，记录阶段信息。
         """
         label = f"S{stage_idx+1}_R{round_idx+1}_E{global_epoch}"
-        result = self.snapshot(n_samples=8, stage_label=label)
+        result = self.snapshot(n_samples=1, stage_label=label)
         result["stage_idx"] = stage_idx
         result["round_idx"] = round_idx
         result["global_epoch"] = global_epoch
@@ -664,9 +664,8 @@ class TrainingDiagnostics:
         snap["fb_complement"] = _stats(fb_val, name="FB(p,g)")
         snap["fb_complement_hist"] = _hist_counts(fb_val)
 
-        # --- 3. 梯度分析 ---
-        print("  [3/4] Gradient analysis ...")
-        snap["grad_analysis"] = self.grad_analyzer.snapshot(n_samples=3)
+        # --- 3. 跳过的梯度分析（训练后用 diagnose_post.py 离线做） ---
+        snap["grad_analysis"] = {"note": "gradient analysis skipped during training, run diagnose_post.py for offline analysis"}
 
         # --- 4. 损失值 ---
         print("  [4/4] Loss values ...")
@@ -727,63 +726,65 @@ class TrainingDiagnostics:
 
     def stage_boundary_snapshot(self, stage_idx, round_idx, global_epoch):
         """
-        在阶段/轮次边界拍**详细梯度快照**（多采样 + 稳定性检测）。
-
-        这个比普通 snapshot 更重（8次梯度采样），只在阶段边界调用。
+        阶段/轮次边界的轻量快照。只做前向诊断（PDE + 输出 + Loss）。
+        不调用 fit()，梯度分析留给训练后的 diagnose_post.py 离线完成。
         """
         print(f"\n{'='*60}")
         print(f"[Diagnostics] Stage Boundary Snapshot: "
               f"Stage {stage_idx+1}, Round {round_idx+1}, Epoch {global_epoch}")
         print(f"{'='*60}")
 
-        def loss_fn():
-            loss_all = self.model.update_loss_seperate()
-            return sum(loss_all)
+        label = f"S{stage_idx+1}_R{round_idx+1}_E{global_epoch}"
+        snap = {
+            "stage_label": label,
+            "stage_idx": stage_idx,
+            "round_idx": round_idx,
+            "global_epoch": global_epoch,
+        }
 
-        # 使用 GradientAnalyzer 的阶段边界快照
-        grad_snap = self.grad_analyzer.stage_boundary_snapshot(
-            stage_idx, round_idx, global_epoch
-        )
-
-        # 附加 PDE 和输出统计
         X_f = self.model.domain.X_f
+
+        # --- 1. PDE 逐项统计 ---
+        print("  [1/3] PDE term decomposition ...")
+        snap["pde_terms"] = self.pde_analyzer.analyze(self.model.u_model, X_f)
+
+        # --- 2. 输出分布 + FB 互补 ---
+        print("  [2/3] Output distribution ...")
         R_tf = tf.constant(X_f[:, 0:1], dtype=tf.float32)
         theta_tf = tf.constant(X_f[:, 1:2], dtype=tf.float32)
         u_preds = self.model.u_model(tf.concat([R_tf, theta_tf], 1))
         p_val = _to_numpy(u_preds[0])
         g_val = _to_numpy(u_preds[1])
 
-        grad_snap["output_p"] = _stats(p_val, name="P_output")
-        grad_snap["output_g"] = _stats(g_val, name="gamma_output")
-        grad_snap["fb_complement"] = _stats(
-            p_val + g_val - np.sqrt(p_val**2 + g_val**2), name="FB"
-        )
+        snap["output_p"] = _stats(p_val, name="P_output")
+        snap["output_g"] = _stats(g_val, name="gamma_output")
+        fb_val = p_val + g_val - np.sqrt(p_val**2 + g_val**2)
+        snap["fb_complement"] = _stats(fb_val, name="FB")
 
-        # 损失值
+        # --- 3. 损失值 ---
+        print("  [3/3] Loss values ...")
         loss_all = self.model.update_loss_seperate()
         loss_names = ['L_Reynolds', 'L_FB', 'L_BC_gamma']
         for i, loss_val in enumerate(loss_all):
             name = loss_names[i] if i < len(loss_names) else f"loss_{i}"
-            grad_snap[f"loss_{name}"] = float(_to_numpy(loss_val))
+            snap[f"loss_{name}"] = float(_to_numpy(loss_val))
 
-        self.stage_boundaries.append(grad_snap)
+        self.stage_boundaries.append(snap)
 
         # 保存
-        label = f"S{stage_idx+1}_R{round_idx+1}_E{global_epoch}"
         snap_path = os.path.join(self.out_dir, f"stage_boundary_{label}.json")
-        self._save_snapshot_json(grad_snap, snap_path)
+        self._save_snapshot_json(snap, snap_path)
         print(f"  Stage boundary snapshot saved → {snap_path}")
 
-        # 打印即时梯度稳定性摘要
-        s = grad_snap.get("summary", {})
-        print(f"  [Gradient Stability] score={s.get('grad_instability_score', 0):.3f}  "
-              f"mean_CV={s.get('mean_CV', 0):.3f}  "
-              f"noisy={s.get('n_noisy', 0)}/{s.get('n_params_total', 0)}  "
-              f"vanishing={s.get('n_vanishing', 0)}  exploding={s.get('n_exploding', 0)}")
-        r = grad_snap.get("layer_grad_balance", {})
-        print(f"  [Layer Grad Ratio] max/min={r.get('max_min_ratio', 0):.1f}  "
-              f"unstable={r.get('is_unstable', False)}  "
-              f"max_layer={r.get('max_layer', '?')[:40]}")
+        # 打印关键指标
+        pde = snap.get("pde_terms", {})
+        print(f"  PDE Reynolds:  part_1={pde.get('part_1',{}).get('mean',0):.2e}  "
+              f"part_2={pde.get('part_2',{}).get('mean',0):.2e}  "
+              f"f_p={pde.get('f_p',{}).get('mean',0):.2e}")
+        print(f"  Output: P∈[{p_val.min():.4f},{p_val.max():.4f}]  "
+              f"γ∈[{g_val.min():.4f},{g_val.max():.4f}]  FB residual={fb_val.mean():.2e}")
+        print(f"  Loss: Reynolds={snap.get('loss_L_Reynolds', 0):.3e}  "
+              f"FB={snap.get('loss_L_FB', 0):.3e}")
 
     def finalize(self):
         """训练结束，汇总所有快照 + 梯度稳定性分析。"""
