@@ -82,15 +82,15 @@ class Config:
     omega_rpm = 6000       # 转速 (rpm)
 
     # 数值参数
-    N_f = 6000             # 配点数
-    N_groove_b = 50        # 槽边界采样点数
-    N_groove_r = 20        # 槽径向边界采样点数
-    domain_fidelity = 50   # 域网格密度
+    N_f = 8000             # 配点数
+    N_groove_b = 100        # 槽边界采样点数
+    N_groove_r = 50        # 槽径向边界采样点数
+    domain_fidelity = 100   # 域网格密度
 
     # ========== 模型架构参数（可配置） ==========
-    Act = "silu"            # 激活函数: "tanh" 或 "silu"
-    core = "mlp"            # 网络类型: "mlp" 或 "pikan" (KAN架构)
-    use_residual = True    # 是否使用残差连接
+    Act = "tanh"            # 激活函数: "tanh" 或 "silu"
+    core = "MLP"            # 网络类型: "mlp" 或 "pikan" (KAN架构)
+    use_residual = False    # 是否使用残差连接
     output_head_dim = 64    # 输出头隐藏层维度 (用于深度输出头)
     coslayer_mode = "mlp"  # 输入编码层: "simple" (原版线性混合) 或 "mlp" (R/θ各自MLP通路)
 
@@ -100,19 +100,19 @@ class Config:
     pikan_layer_sizes = [2, 64, 64, 64, 64, 2]  # PIKAN 层大小
 
     # 训练参数
-    layer_sizes = [2, 128, 128, 256 ,128, 128, 2]
-    N_train = 1000         # 每阶段训练迭代数
+    layer_sizes = [2, 128, 128, 256 ,128, 128, 2]  #[2, 128, 128 , 128 ,256 , 256 , 256 , 128 ,128, 128, 2] 
+    N_train = 10000         # 每阶段训练迭代数
     NL_train = 4           # RAD细化轮数
     ratio_RAD_list = [0.03, 0.01]  # RAD采样比例
     batch_size = 2048      # minibatch大小; None=全批量, int=随机minibatch
 
     # 诊断参数
     diag_enabled = True         # 是否启用训练诊断
-    diag_interval = 500         # 诊断快照间隔 (epoch 数); 0=仅阶段边界
+    diag_interval = 1000         # 诊断快照间隔 (epoch 数); 0=仅阶段边界
 
     # 硬件 / 输出
-    output_dir = "output_tf"  # 输出目录
-    device = "1"              # GPU设备ID, 例如 "0", "1", "5"
+    output_dir = "output_resF_tanh" #"output_resF_tanh_large"  # 输出目录
+    device = "5"              # GPU设备ID, 例如 "0", "1", "5"
 
     # 绘图参数
     dpi_save = 600
