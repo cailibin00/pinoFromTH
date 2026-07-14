@@ -188,15 +188,18 @@ def create_H_func(params, cfg: Config):
     def theta_sym(R):
         """螺旋线方程"""
         return tf.math.log(R / r_g) / tf.math.tan(alpha)+theta_offset
-    
+
     def H_func(R, theta):
         """膜厚分布函数，使用sigmoid平滑"""
+        # 螺旋线方程（内联以避免 tf.function autograph 闭包穿透问题）
+        theta_spiral = tf.math.log(R / r_g) / tf.math.tan(alpha) + theta_offset
+
         # 螺旋槽区域判断（使用sigmoid平滑）
         periodic_offsets = [0, -2*np.pi/K_val, -4*np.pi/K_val, 2*np.pi/K_val, 4*np.pi/K_val]
         periodic_terms = []
         for offset in periodic_offsets:
-            term = (tf.math.sigmoid((theta - theta_sym(R) + offset) / xi_theta) * 
-                   tf.math.sigmoid((theta_sym(R) - theta + 2*np.pi/K_val*groove_ratio - offset) / xi_theta))
+            term = (tf.math.sigmoid((theta - theta_spiral + offset) / xi_theta) *
+                   tf.math.sigmoid((theta_spiral - theta + 2*np.pi/K_val*groove_ratio - offset) / xi_theta))
             periodic_terms.append(term)
         
         is_texture = (tf.math.sigmoid((R - R_d_1) / xi_R) * 
@@ -561,7 +564,8 @@ def main():
 
     # 创建膜厚函数和PDE模型
     H_func, theta_sym = create_H_func(params, cfg)
-    f_model_FBNS, f_model_FB = create_pde_models(H_func, params)
+    H_func_tf = tf.function(H_func)  # 包装为 tf.function，避免 autograph 闭包穿透导致 NameError
+    f_model_FBNS, f_model_FB = create_pde_models(H_func_tf, params)
 
     # 创建计算域
     Domain = DomainND(["R", "theta"])
