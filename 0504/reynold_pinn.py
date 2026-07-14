@@ -505,9 +505,12 @@ def plot_results(model, params, cfg: Config, save_prefix='result'):
 # =============================================================================
 # 8. 主程序
 # =============================================================================
-def main():
-    # 初始化配置
-    cfg = Config()
+def main(config_id=1):
+    # 初始化配置 — 从 config/ 目录按序号加载
+    from config import get_config
+    cfg = get_config(config_id)
+    print(f"[Config] 加载配置 C{config_id}: Act={cfg.Act}, residual={cfg.use_residual}, "
+          f"layers={cfg.layer_sizes}, output={cfg.output_dir}")
 
     # ---- 设备设置 ----
     gpu_id = int(cfg.device)
@@ -659,4 +662,9 @@ def main():
 
 
 if __name__ == "__main__":
-    model = main()
+    import argparse
+    parser = argparse.ArgumentParser(description="Reynolds PINN 训练")
+    parser.add_argument("config_id", nargs="?", type=int, default=1,
+                        help="配置序号 (对应 config/cN.py)，默认 1")
+    args = parser.parse_args()
+    model = main(config_id=args.config_id)
