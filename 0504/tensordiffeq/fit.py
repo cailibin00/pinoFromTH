@@ -133,7 +133,7 @@ def train_op_inner(obj):
                 obj.variables.extend(obj.MTL_adapt_par)
                 #loss_value, grads = obj.grad()
                 loss_value, grads, loss_all = obj.grad_seperate_all_with_adapt_weight()
-                #grads = [tf.clip_by_norm(g, 2) for g in grads]
+                grads = [tf.clip_by_norm(g, 2) for g in grads]
                 obj.tf_optimizer.apply_gradients(zip(grads, obj.variables))
 
             else:

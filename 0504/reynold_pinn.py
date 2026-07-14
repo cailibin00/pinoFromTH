@@ -26,7 +26,6 @@ from scipy.interpolate import griddata
 from tensordiffeq.boundaries import dirichletBC
 from tensordiffeq.domains import DomainND
 from tensordiffeq.models import CollocationSolverND
-from tensordiffeq.utils import get_tf_model
 from diagnose import TrainingDiagnostics, post_training_analysis, gradient_impact_detailed_analysis
 
 
@@ -100,13 +99,12 @@ class Config:
     pikan_layer_sizes = [2, 64, 64, 64, 64, 2]  # PIKAN 层大小
 
     # 训练参数
-    layer_sizes = [2, 128, 128, 256 ,128, 128, 2]  #[2, 128, 128 , 128 ,256 , 256 , 256 , 128 ,128, 128, 2] 
-    N_train = 10000         # 每阶段训练迭代数
-    NL_train = 4           # RAD细化轮数
-    ratio_RAD_list = [0.03, 0.01]  # RAD采样比例
-    use_RAD = False          # 是否启用 RAD 配点重采样 (False=完全关闭)
-    RAD_frequency = "stage" # RAD 触发频率: "round"=每轮, "stage"=仅阶段边界, 整数=每N轮
-    batch_size = 2048      # minibatch大小; None=全批量, int=随机minibatch
+    layer_sizes = [2, 128, 128, 256 ,128, 128, 2]
+    total_epochs = 30000      # 总训练 epoch 数
+    warmup_epochs = 1000      # warmup epoch 数 (前 N 步 lr 从 0 线性增长)
+    peak_lr = 1e-3            # warmup 达到的最高学习率
+    min_lr = 1e-6             # 余弦衰减最低学习率
+    batch_size = 2048         # minibatch大小; None=全批量, int=随机minibatch
 
     # 诊断参数
     diag_enabled = True         # 是否启用训练诊断
@@ -299,92 +297,89 @@ def generate_groove_points(theta_sym, params, cfg: Config):
 
 
 # =============================================================================
-# 6. 训练流程
+# 6. 学习率调度器
 # =============================================================================
-def train_model(model, cfg: Config, N_f_true, params=None, diag=None):
+class WarmupCosineDecay(tf.keras.optimizers.schedules.LearningRateSchedule):
+    """Warmup + 余弦衰减学习率调度器。
+
+    lr:  0 ──线性增长──→ peak_lr ──余弦衰减──→ min_lr
+         |← warmup_epochs →|←───  decay zone  ───→|
     """
-    多阶段训练流程（集成诊断钩子）。
 
-    Args:
-        model: CollocationSolverND 实例
-        cfg: Config
-        N_f_true: 实际配点数
-        params: 物理参数字典 (诊断需要)
-        diag: TrainingDiagnostics 实例 (None=不启用)
-    """
-    lr_schedules = [
-        {'boundaries': [20000, 40000], 'values': [1e-3, 1e-4, 1e-5]},
-        {'boundaries': [20000, 40000], 'values': [1e-4, 1e-4, 1e-5]},
-        {'boundaries': [20000, 40000], 'values': [1e-5, 1e-5, 1e-6]},
-        {'boundaries': [20000, 40000], 'values': [1e-5, 1e-5, 1e-6]},
-    ]
+    def __init__(self, peak_lr, warmup_epochs, total_epochs, min_lr=1e-6):
+        super().__init__()
+        self.peak_lr = peak_lr
+        self.warmup_epochs = warmup_epochs
+        self.total_epochs = total_epochs
+        self.min_lr = min_lr
 
-    global_epoch = 0  # 跨所有阶段的累计 epoch
+    def __call__(self, step):
+        step = tf.cast(step, tf.float32)
+        w = tf.cast(self.warmup_epochs, tf.float32)
+        t = tf.cast(self.total_epochs, tf.float32)
 
-    # 初始阶段边界快照 (epoch 0)
+        warmup_lr = self.peak_lr * (step / tf.maximum(w, 1.0))
+
+        decay_steps = t - w
+        cosine = 0.5 * (1.0 + tf.cos(
+            tf.constant(np.pi, dtype=tf.float32) * (step - w) / tf.maximum(decay_steps, 1.0)
+        ))
+        decay_lr = self.min_lr + (self.peak_lr - self.min_lr) * cosine
+
+        return tf.where(step < w, warmup_lr, decay_lr)
+
+    def get_config(self):
+        return {
+            "peak_lr": self.peak_lr,
+            "warmup_epochs": self.warmup_epochs,
+            "total_epochs": self.total_epochs,
+            "min_lr": self.min_lr,
+        }
+
+
+# =============================================================================
+# 7. 训练流程 (简化版: 单阶段, 无 RAD)
+# =============================================================================
+def train_model(model, cfg: Config, params=None, diag=None):
+    """单阶段训练 — Warmup + Cosine，无 Stage/Round/RAD。"""
+    lr_schedule = WarmupCosineDecay(
+        peak_lr=cfg.peak_lr,
+        warmup_epochs=cfg.warmup_epochs,
+        total_epochs=cfg.total_epochs,
+        min_lr=cfg.min_lr,
+    )
+    model.tf_optimizer = tf.keras.optimizers.legacy.Adam(lr_schedule, beta_1=0.99)
+
+    print(f"\n[Train] Warmup-Cosine: peak={cfg.peak_lr}, warmup={cfg.warmup_epochs}, "
+          f"total={cfg.total_epochs}, min={cfg.min_lr}")
+    print(f"[Train] Architecture: Act={cfg.Act}, residual={cfg.use_residual}, "
+          f"layers={cfg.layer_sizes}")
+
+    # 初始快照
     if diag is not None and cfg.diag_enabled:
-        diag.stage_boundary_snapshot(0, 0, 0)
+        diag.snapshot(0)
 
-    for stage_idx, schedule in enumerate(lr_schedules):
-        lr_decay = tf.keras.optimizers.schedules.PiecewiseConstantDecay(
-            boundaries=schedule['boundaries'], values=schedule['values'])
-        model.tf_optimizer = tf.keras.optimizers.legacy.Adam(lr_decay, beta_1=0.99)
-        print(f"\n[Stage {stage_idx+1}/4] LR schedule: {schedule['values']}")
+    remaining = cfg.total_epochs
+    global_epoch = 0
 
-        for round_idx in range(cfg.NL_train):
-            print(f"  Round {round_idx+1}/{cfg.NL_train} (epoch {global_epoch}–{global_epoch+cfg.N_train})")
+    while remaining > 0:
+        chunk = min(cfg.diag_interval, remaining) if cfg.diag_enabled else remaining
+        model.fit(tf_iter=chunk, newton_iter=0, batch_sz=cfg.batch_size)
+        global_epoch += chunk
+        remaining -= chunk
+        print(f"  epoch {global_epoch}/{cfg.total_epochs}, loss={model.loss_history[-1]:.2f}")
 
-            # 阶段+轮次边界 → 详细梯度快照
-            if diag is not None and cfg.diag_enabled:
-                diag.stage_boundary_snapshot(stage_idx, round_idx, global_epoch)
+        if diag is not None and cfg.diag_enabled and remaining > 0:
+            diag.snapshot(global_epoch)
 
-            # 分批训练以支持中间诊断快照
-            diag_interval = cfg.diag_interval if cfg.diag_enabled and cfg.diag_interval > 0 else cfg.N_train
-            remaining = cfg.N_train
-
-            while remaining > 0:
-                chunk = min(diag_interval, remaining)
-                model.fit(tf_iter=chunk, newton_iter=0, batch_sz=cfg.batch_size)
-                global_epoch += chunk
-                remaining -= chunk
-
-                # 中间轻量快照 (只有 PDE + 输出 + 轻量梯度)
-                if diag is not None and cfg.diag_enabled and remaining > 0:
-                    diag.snapshot(global_epoch)
-
-            # RAD 细化 (可通过 cfg.use_RAD 关闭，cfg.RAD_frequency 控制频率)
-            if cfg.use_RAD:
-                do_rad = False
-                if cfg.RAD_frequency == "round":
-                    do_rad = True
-                elif cfg.RAD_frequency == "stage":
-                    do_rad = (round_idx == cfg.NL_train - 1)  # 仅在每阶段最后一轮
-                elif isinstance(cfg.RAD_frequency, int):
-                    do_rad = (round_idx % cfg.RAD_frequency == 0)
-                # 最后一轮之后不需要 RAD (训练结束)
-                is_last_round = (stage_idx == len(lr_schedules) - 1 and round_idx == cfg.NL_train - 1)
-                if do_rad and not is_last_round:
-                    print(f"    [RAD] resampling collocation points...")
-                    model.RAD_FB(
-                        model.f_model_list + [model.f_model_FB],
-                        N_f_true,
-                        num_add_points_test=round(10 * N_f_true),
-                        num_add_points=[round(r * N_f_true) for r in cfg.ratio_RAD_list],
-                        k=1, c=1e-16
-                    )
-                else:
-                    print(f"    [RAD] skipped (frequency={cfg.RAD_frequency}, round={round_idx+1})")
-
-    # 训练结束 → 最终阶段边界快照
     if diag is not None and cfg.diag_enabled:
-        diag.stage_boundary_snapshot(3, cfg.NL_train - 1, global_epoch)
         diag.finalize()
 
     return model
 
 
 # =============================================================================
-# 7. 可视化
+# 8. 可视化
 # =============================================================================
 def plot_results(model, params, cfg: Config, save_prefix='result'):
     """
@@ -503,7 +498,7 @@ def plot_results(model, params, cfg: Config, save_prefix='result'):
     print(f"figures saved to: {os.path.dirname(save_prefix)}")
 
 # =============================================================================
-# 8. 主程序
+# 9. 主程序
 # =============================================================================
 def main(config_id=1):
     # 初始化配置 — 从 config/ 目录按序号加载
@@ -568,7 +563,7 @@ def main(config_id=1):
     # 创建膜厚函数和PDE模型
     H_func, theta_sym = create_H_func(params, cfg)
     H_func_tf = tf.function(H_func)  # 包装为 tf.function，避免 autograph 闭包穿透导致 NameError
-    f_model_FBNS, f_model_FB = create_pde_models(H_func_tf, params)
+    f_model_FBNS, f_model_FB = create_pde_models(H_func_tf, params)  # f_model_FB 保留备用
 
     # 创建计算域
     Domain = DomainND(["R", "theta"])
@@ -612,10 +607,6 @@ def main(config_id=1):
     model.best_weights_path = os.path.join(ckpt_dir, 'epochs_best_model')
     model.u_model.save_weights(model.best_weights_path)
 
-    # 设置额外模型
-    model.f_model_FB = tf.function(f_model_FB)
-    model.f_model_list = [get_tf_model(f_model_FBNS)]
-
     # ---- 初始化诊断 ----
     diag = None
     if cfg.diag_enabled:
@@ -623,7 +614,7 @@ def main(config_id=1):
 
     # 训练
     print("Starting training...")
-    model = train_model(model, cfg, N_f_true, params=params, diag=diag)
+    model = train_model(model, cfg, params=params, diag=diag)
 
     # ---- 训练后诊断 ----
     if cfg.diag_enabled:
@@ -632,7 +623,7 @@ def main(config_id=1):
         gradient_impact_detailed_analysis(model, params, cfg, output_dir)
 
     # 保存最终模型到 models/
-    model_name = f'reynolds_pinn_N{cfg.N_f}_iter{cfg.N_train * cfg.NL_train * 4}'
+    model_name = f'reynolds_pinn_N{cfg.N_f}_epoch{cfg.total_epochs}'
     model_path = os.path.join(models_dir, model_name)
     model.save(model_path)
     print(f"Model saved to: {model_path}")
