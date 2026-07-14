@@ -315,7 +315,7 @@ def train_model(model, cfg: Config, N_f_true, params=None, diag=None):
     lr_schedules = [
         {'boundaries': [20000, 40000], 'values': [1e-3, 1e-4, 1e-5]},
         {'boundaries': [20000, 40000], 'values': [1e-4, 1e-4, 1e-5]},
-        {'boundaries': [20000, 40000], 'values': [1e-5, 1e-4, 1e-5]},
+        {'boundaries': [20000, 40000], 'values': [1e-5, 1e-5, 1e-6]},
         {'boundaries': [20000, 40000], 'values': [1e-5, 1e-5, 1e-6]},
     ]
 
