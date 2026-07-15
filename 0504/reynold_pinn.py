@@ -478,6 +478,60 @@ def _create_lr_schedule(cfg):
 
 
 # =============================================================================
+# 6.5. 模型架构快照 (用于 resume 时精确重建)
+# =============================================================================
+# 影响模型结构的配置键
+_ARCH_KEYS = [
+    'layer_sizes', 'core', 'Act', 'use_residual', 'coslayer_mode',
+    'output_head_dim', 'kan_grid_size', 'kan_spline_order', 'pikan_layer_sizes',
+]
+
+
+def _save_model_config(cfg, ckpt_dir):
+    """保存模型架构参数到 JSON，供 resume 时精确重建同一架构。"""
+    config_data = {}
+    for k in _ARCH_KEYS:
+        v = getattr(cfg, k, None)
+        if isinstance(v, (list, tuple)):
+            v = [float(x) if hasattr(x, 'item') else x for x in v]
+        elif hasattr(v, 'item'):
+            v = v.item()
+        config_data[k] = v
+    path = os.path.join(ckpt_dir, 'model_config.json')
+    with open(path, 'w', encoding='utf-8') as f:
+        json.dump(config_data, f, indent=2)
+    print(f"[Config] 模型架构已备份到: {path}")
+
+
+def _apply_model_config(cfg, ckpt_dir):
+    """从 model_config.json 读取架构参数并覆盖 cfg。
+    如果文件不存在则打印警告并使用当前 config（兼容旧 checkpoint）。
+    """
+    path = os.path.join(ckpt_dir, 'model_config.json')
+    if not os.path.exists(path):
+        print(f"[Resume] ⚠ 未找到 model_config.json，将使用当前 config 的架构。")
+        print(f"[Resume]   如果出现 shape mismatch，说明训练时的架构与当前 config 不一致。")
+        print(f"[Resume]   请确认 config 文件与训练时一致后重试。")
+        return cfg
+    with open(path, 'r', encoding='utf-8') as f:
+        arch = json.load(f)
+    print(f"[Resume] 从 checkpoint 恢复模型架构: {path}")
+    changed = []
+    for k, v in arch.items():
+        old = getattr(cfg, k, None)
+        setattr(cfg, k, v)
+        if str(old) != str(v):
+            changed.append(f"  {k}: {old} → {v}")
+    if changed:
+        print("[Resume] 架构参数已覆盖:")
+        for line in changed:
+            print(line)
+    else:
+        print("[Resume] 架构参数与当前 config 一致，无需覆盖。")
+    return cfg
+
+
+# =============================================================================
 # 7. 训练流程 (支持 loss 平衡 / LR 调度器选择 / L-BFGS 精调)
 # =============================================================================
 def train_model(model, cfg: Config, params=None, diag=None, skip_adam=False):
@@ -763,6 +817,17 @@ def main(config_id=1, resume=False, resume_path=None):
     ensure_dir(models_dir)
     ensure_dir(figures_dir)
 
+    # ---- 断点续训: 从 checkpoint 恢复模型架构 ----
+    skip_adam = False
+    if resume:
+        load_path = resume_path if resume_path else os.path.join(ckpt_dir, 'epochs_best_model')
+        resume_ckpt_dir = os.path.dirname(load_path)
+        if not os.path.exists(resume_ckpt_dir):
+            os.makedirs(resume_ckpt_dir, exist_ok=True)
+        # 尝试从 model_config.json 恢复架构参数
+        _apply_model_config(cfg, resume_ckpt_dir)
+        skip_adam = True
+
     # 重定向 stdout 到日志文件
     log_path = os.path.join(log_dir, 'train.txt')
     tee = Tee(log_path)
@@ -837,25 +902,39 @@ def main(config_id=1, resume=False, resume_path=None):
     # 最佳模型保存到 checkpoints/
     model.best_weights_path = os.path.join(ckpt_dir, 'epochs_best_model')
 
+    # ── 保存模型架构快照 (供未来 resume 精确重建) ────────────────────────────
+    _save_model_config(cfg, ckpt_dir)
+
     # ---- 断点续训: 加载已保存权重 ----
-    skip_adam = False
     if resume:
         load_path = resume_path if resume_path else model.best_weights_path
-        if not os.path.exists(load_path + ".index") and not os.path.exists(load_path + ".data-00000-of-00001"):
-            # 尝试 TF checkpoint 格式
-            if os.path.exists(os.path.dirname(load_path)):
-                ckpt_files = os.listdir(os.path.dirname(load_path))
+        # 检查文件存在性
+        ckpt_index = load_path + ".index"
+        ckpt_data = load_path + ".data-00000-of-00001"
+        if not os.path.exists(ckpt_index) and not os.path.exists(ckpt_data):
+            ckpt_dir_list = os.path.dirname(load_path)
+            if os.path.exists(ckpt_dir_list):
+                ckpt_files = os.listdir(ckpt_dir_list)
                 if ckpt_files:
-                    print(f"[Resume] checkpoint 目录内容: {ckpt_files}")
+                    print(f"[Resume] checkpoint 目录内容 ({ckpt_dir_list}): {ckpt_files}")
             raise FileNotFoundError(
                 f"[Resume] 找不到模型权重: {load_path}\n"
                 f"  请确认权重文件存在于: {os.path.dirname(load_path)}"
             )
-        model.u_model.load_weights(load_path)
+        try:
+            model.u_model.load_weights(load_path)
+        except ValueError as e:
+            raise ValueError(
+                f"[Resume] 权重加载失败 — 模型架构与 checkpoint 不匹配!\n"
+                f"  错误: {e}\n"
+                f"  可能原因:\n"
+                f"    1. checkpoint 训练时的 config 与当前不同\n"
+                f"    2. 代码中的模型结构发生了改变\n"
+                f"  解决: 确保 config 文件与训练时完全一致。\n"
+                f"  备选: 使用 --resume-path 指向另一个 checkpoint 目录。"
+            )
         print(f"[Resume] 成功加载已训练权重: {load_path}")
-        skip_adam = True
 
-        # 如果用户没开 fine_tune，提示
         if not cfg.fine_tune_enabled:
             print("[Resume] 警告: fine_tune_enabled=False，将不会进行 L-BFGS 精调。")
             print("[Resume] 仅完成权重加载。如需精调，请在 config 中设置 fine_tune_enabled=True。")

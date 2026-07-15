@@ -221,8 +221,9 @@ class CollocationSolverND:
 
         # Residual Equations
         #####################################
-        loss_res = self.update_loss_res()
-        loss_all.append(loss_res)
+        for f_model in self.f_model_list:
+            loss_res = self.update_loss_res(f_model)
+            loss_all = loss_all + loss_res
 
         # boundary condition
         if (self.Boundary_true==True):
