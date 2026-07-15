@@ -64,6 +64,14 @@ class Config(BaseConfig):
     fb_loss_weight = 1.0
     loss_balance_alpha = 0.2
 
+    # ========== Reynolds 损失缩放 (缩小 PDE 残差项) ==========
+    # schedule 上限: log-space 1e-8 → 1e-6 → 1e-4 → max，光滑渐进升温
+    reynolds_weight_mode = "adaptive"  # "fixed" | "adaptive"
+    reynolds_loss_weight = 1e-4        # fixed 模式: 直接缩放因子
+    reynolds_weight_target = 0.01      # adaptive: loss-driven 目标贡献值
+    reynolds_weight_min = 1e-8         # adaptive: 起始权重 (epoch 0)
+    reynolds_weight_max = 1e-3         # adaptive: 最终权重 (epoch → total)
+
     # ========== L-BFGS 精调 ==========
     fine_tune_enabled = False
     fine_tune_epochs = 1000

@@ -37,7 +37,7 @@ class Config(BaseConfig):
     Act = "silu"              
     core = "MLP"
     use_residual = False       
-    output_head_dim = 64
+    output_head_dim = 128
     coslayer_mode = "mlp"
 
     # ========== 训练参数 ==========
@@ -71,13 +71,21 @@ class Config(BaseConfig):
 
     # ========== Loss 平衡 ==========
     # 推荐: "fixed" + fb_loss_weight=1000（JFO 问题 FB 项需要强加权）
-    loss_balance_mode = "none"
-    fb_loss_weight = 1.0 # fb权重
+    loss_balance_mode = "fixed"
+    fb_loss_weight = 1 # fb权重
     loss_balance_alpha = 0.2 # auto 模式下 EMA 平滑系数
+
+    # ========== Reynolds 损失缩放 (缩小 PDE 残差项) ==========
+    # schedule 上限: log-space 1e-8 → 1e-6 → 1e-4 → max，光滑渐进升温
+    reynolds_weight_mode = "adaptive"  # "fixed" | "adaptive"
+    reynolds_loss_weight = 1e-4        # fixed 模式: 直接缩放因子
+    reynolds_weight_target = 0.01      # adaptive: loss-driven 目标贡献值
+    reynolds_weight_min = 1e-7         # adaptive: 起始权重 (epoch 0)
+    reynolds_weight_max = 1e-3         # adaptive: 最终权重 (epoch → total)
 
     # ========== L-BFGS 精调 ==========
     # 推荐: True + fine_tune_epochs=1000（Adam落地后精调边界）
-    fine_tune_enabled = True
+    fine_tune_enabled = False
     fine_tune_epochs = 1000
     fine_tune_eager = False
 

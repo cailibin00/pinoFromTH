@@ -8,6 +8,7 @@ Reynolds方程PINN求解器 - 螺旋槽空化问题
 import os
 import sys
 import json
+import math
 
 # 获取脚本所在目录
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -126,6 +127,17 @@ class Config:
     loss_balance_mode = "none"
     fb_loss_weight = 1.0          # fixed 模式下的 FB 项权重 (推荐: 100~10000)
     loss_balance_alpha = 0.2      # auto 模式下的 EMA 平滑系数
+
+    # ========== Reynolds 损失缩放 (缩小 PDE 残差项) ==========
+    # Reynolds 方程天然是 stiff PDE (轴承数 Λ≈9000)，PDE 残差在 10^3~10^8 量级
+    # 而 FB/JFO 约束项在 10^-7 量级。需要用权重把 Reynolds 项压下来。
+    # 混合策略：loss-driven 决定权重值，schedule 限制上限，逐步从 1e-8→1e-6→1e-4→max
+    reynolds_weight_mode = "adaptive"  # "fixed" | "adaptive" | "schedule"
+    reynolds_loss_weight = 1e-4        # fixed 模式: 直接缩放因子
+    reynolds_weight_target = 0.01      # adaptive: 目标加权贡献值
+    reynolds_weight_min = 1e-8         # adaptive: 权重下限 (起始值)
+    reynolds_weight_max = 1e-3         # adaptive: 权重上限 (最终绝不超 1e-2)
+    reynolds_weight_ema_beta = 0.99    # adaptive: EMA 平滑系数 (高β=更平滑)
 
     # ========== L-BFGS 精调 (可配置) ==========
     fine_tune_enabled = False     # Adam 训练结束后是否运行 L-BFGS 精调
@@ -556,14 +568,34 @@ def train_model(model, cfg: Config, params=None, diag=None, skip_adam=False):
             new_weights = np.ones((1, n_terms), dtype=np.float32)
             if n_terms >= 2:
                 new_weights[0, 1] = cfg.fb_loss_weight
+            # 应用 Reynolds 缩放权重
+            if cfg.reynolds_weight_mode == "fixed":
+                new_weights[0, 0] = cfg.reynolds_loss_weight
+            elif cfg.reynolds_weight_mode == "adaptive":
+                # 自适应模式：初始给下限值 (schedule 从 1e-8 开始升温)
+                new_weights[0, 0] = cfg.reynolds_weight_min
             model.adaptive_constant_func.adaptive_constant.assign(
                 tf.constant(new_weights)
             )
-            print(f"[Train] Loss balance: fixed, FB weight={cfg.fb_loss_weight:.1e}")
+            print(f"[Train] Loss balance: fixed, FB weight={cfg.fb_loss_weight:.1e}, "
+                  f"Reynolds mode={cfg.reynolds_weight_mode}")
         elif cfg.loss_balance_mode == "auto":
             print(f"[Train] Loss balance: auto (GradNorm), alpha={cfg.loss_balance_alpha}")
         else:
             print(f"[Train] Loss balance: none (equal weights)")
+
+        # ── 2.5 Reynolds 权重初始化 (非 fixed 模式) ────────────────────────────
+        if cfg.reynolds_weight_mode == "adaptive" and cfg.loss_balance_mode != "fixed":
+            current = model.adaptive_constant_func.adaptive_constant.numpy()
+            current[0, 0] = cfg.reynolds_weight_min
+            model.adaptive_constant_func.adaptive_constant.assign(tf.constant(current))
+            print(f"[Train] Reynolds weight: adaptive (min={cfg.reynolds_weight_min:.0e} → "
+                  f"max={cfg.reynolds_weight_max:.0e}, target={cfg.reynolds_weight_target})")
+        elif cfg.reynolds_weight_mode == "fixed" and cfg.loss_balance_mode != "fixed":
+            current = model.adaptive_constant_func.adaptive_constant.numpy()
+            current[0, 0] = cfg.reynolds_loss_weight
+            model.adaptive_constant_func.adaptive_constant.assign(tf.constant(current))
+            print(f"[Train] Reynolds weight: fixed = {cfg.reynolds_loss_weight:.1e}")
 
         print(f"[Train] Architecture: Act={cfg.Act}, residual={cfg.use_residual}, "
               f"layers={cfg.layer_sizes}")
@@ -581,6 +613,41 @@ def train_model(model, cfg: Config, params=None, diag=None, skip_adam=False):
             global_epoch += chunk
             remaining -= chunk
             print(f"  epoch {global_epoch}/{cfg.total_epochs}, loss={model.loss_history[-1]:.2f}")
+
+            # ── 自适应 Reynolds 权重更新 ────────────────────────────────────────
+            if cfg.reynolds_weight_mode == "adaptive" and model.loss_all_history:
+                last_loss_all = model.loss_all_history[-1]
+                reynolds_val = float(last_loss_all[0])  # loss_all[0] = L_Reynolds
+
+                # EMA 追踪 Reynolds loss
+                if not hasattr(model, '_reynolds_ema'):
+                    model._reynolds_ema = reynolds_val
+                else:
+                    model._reynolds_ema = (cfg.reynolds_weight_ema_beta * model._reynolds_ema
+                                           + (1.0 - cfg.reynolds_weight_ema_beta) * reynolds_val)
+
+                # ── 调度上限：log-space 从 min → max 渐进升温 ─────────────────
+                # 1e-8 → 1e-6 → 1e-4 → max，光滑过渡
+                progress = global_epoch / cfg.total_epochs  # 0 → 1
+                log_min = math.log10(cfg.reynolds_weight_min)
+                log_max = math.log10(cfg.reynolds_weight_max)
+                log_ceiling = log_min + progress * (log_max - log_min)
+                ceiling = 10.0 ** log_ceiling
+
+                # ── 权重：loss-driven but capped by schedule ──────────────────
+                loss_weight = cfg.reynolds_weight_target / (model._reynolds_ema + 1e-10)
+                # 不能低于下限，不能超过调度上限
+                r_weight = max(cfg.reynolds_weight_min, min(loss_weight, ceiling))
+
+                # 更新 adaptive_constant
+                current = model.adaptive_constant_func.adaptive_constant.numpy()
+                current[0, 0] = r_weight
+                model.adaptive_constant_func.adaptive_constant.assign(tf.constant(current))
+                if global_epoch % (cfg.diag_interval) == 0 or global_epoch == chunk:
+                    print(f"    [R-weight] epoch={global_epoch}, "
+                          f"EMA={model._reynolds_ema:.1e}, "
+                          f"ceiling={ceiling:.2e}, weight={r_weight:.2e}, "
+                          f"weighted={r_weight * model._reynolds_ema:.2e}")
 
             if diag is not None and cfg.diag_enabled and remaining > 0:
                 diag.snapshot(global_epoch)
