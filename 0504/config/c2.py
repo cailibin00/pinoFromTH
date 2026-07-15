@@ -34,7 +34,7 @@ class Config(BaseConfig):
     domain_fidelity = 100
 
     # ========== 模型架构 ==========
-    Act = "silu"              # ← 关键改动
+    Act = "silu"              
     core = "MLP"
     use_residual = False       
     output_head_dim = 64
@@ -53,7 +53,7 @@ class Config(BaseConfig):
     diag_interval = 1000
 
     # ========== 输出 ==========
-    output_dir = "output_resF_silu_large"
+    output_dir = "output_resF_silu_small"
     device = "5"
 
     # ========== 绘图 ==========
@@ -61,3 +61,24 @@ class Config(BaseConfig):
     dpi_watch = 150
     text_size = 18
     font_size = 20
+
+    # ========== 学习率调度器 ==========
+    # 推荐: "cyclic"（对此问题loss景观崎岖效果好）| "warmup_cosine"（稳定baseline）
+    lr_schedule = "warmup_cosine"  # warmup_cosine | cyclic | cosine | one_cycle
+    lr_cycle_period = 5000  # 每 5000 epochs restart
+    lr_cycle_decay = 0.7    # 每次 restart peak_lr 降为 70%
+    lr_cycle_min_factor = 0.01
+
+    # ========== Loss 平衡 ==========
+    # 推荐: "fixed" + fb_loss_weight=1000（JFO 问题 FB 项需要强加权）
+    loss_balance_mode = "none"
+    fb_loss_weight = 1.0 # fb权重
+    loss_balance_alpha = 0.2 # auto 模式下 EMA 平滑系数
+
+    # ========== L-BFGS 精调 ==========
+    # 推荐: True + fine_tune_epochs=1000（Adam落地后精调边界）
+    fine_tune_enabled = True
+    fine_tune_epochs = 1000
+    fine_tune_eager = True
+
+

@@ -53,6 +53,22 @@ class Config(BaseConfig):
     min_lr = 1e-6
     batch_size = 2048
 
+    # ========== 学习率调度器 ==========
+    lr_schedule = "warmup_cosine"
+    lr_cycle_period = 5000
+    lr_cycle_decay = 0.7
+    lr_cycle_min_factor = 0.01
+
+    # ========== Loss 平衡 ==========
+    loss_balance_mode = "none"
+    fb_loss_weight = 1.0
+    loss_balance_alpha = 0.2
+
+    # ========== L-BFGS 精调 ==========
+    fine_tune_enabled = False
+    fine_tune_epochs = 1000
+    fine_tune_eager = True
+
     # ========== 诊断 ==========
     diag_enabled = True
     diag_interval = 1000

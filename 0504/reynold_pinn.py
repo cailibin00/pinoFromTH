@@ -106,6 +106,32 @@ class Config:
     min_lr = 1e-6             # 余弦衰减最低学习率
     batch_size = 2048         # minibatch大小; None=全批量, int=随机minibatch
 
+    # ========== 学习率调度器 (可配置) ==========
+    # 选项: "warmup_cosine" | "cosine" | "cyclic" | "one_cycle"
+    #   warmup_cosine: warmup → cosine decay (推荐: 稳定的baseline)
+    #   cosine:        纯 cosine decay, 无 warmup
+    #   cyclic:        Cosine Annealing with Warm Restarts (推荐: 崎岖loss景观)
+    #   one_cycle:     One-Cycle Policy, 先升后降 (推荐: 快速收敛)
+    lr_schedule = "warmup_cosine"
+    # Cyclic / One-Cycle 参数:
+    lr_cycle_period = 5000       # cyclic: 每周期epoch数; one_cycle: 上升阶段epoch数
+    lr_cycle_decay = 0.7         # cyclic: 每周期peak_lr衰减因子 (<1 则逐周期递减)
+    lr_cycle_min_factor = 0.01   # cyclic: min_lr 相对于 peak_lr 的比例
+
+    # ========== Loss 平衡 (可配置) ==========
+    # 选项: "none" | "fixed" | "auto"
+    #   none:  所有 loss 项等权 (默认, 当前行为)
+    #   fixed: 对 FB 互补项施加固定权重 (推荐: 对 JFO 问题效果好)
+    #   auto:  基于梯度量级的自适应权重 (GradNorm风格)
+    loss_balance_mode = "none"
+    fb_loss_weight = 1.0          # fixed 模式下的 FB 项权重 (推荐: 100~10000)
+    loss_balance_alpha = 0.2      # auto 模式下的 EMA 平滑系数
+
+    # ========== L-BFGS 精调 (可配置) ==========
+    fine_tune_enabled = False     # Adam 训练结束后是否运行 L-BFGS 精调
+    fine_tune_epochs = 1000       # L-BFGS 迭代步数 (推荐: 500~2000)
+    fine_tune_eager = True        # True=eager模式 (快), False=graph模式
+
     # 诊断参数
     diag_enabled = True         # 是否启用训练诊断
     diag_interval = 1000         # 诊断快照间隔 (epoch 数); 0=仅阶段边界
@@ -337,24 +363,156 @@ class WarmupCosineDecay(tf.keras.optimizers.schedules.LearningRateSchedule):
         }
 
 
+# ── 额外的 LR 调度器 ──────────────────────────────────────────────────────────
+class CosineDecay(tf.keras.optimizers.schedules.LearningRateSchedule):
+    """纯 Cosine 衰减 (无 warmup): peak_lr → min_lr"""
+
+    def __init__(self, peak_lr, total_epochs, min_lr=1e-6):
+        super().__init__()
+        self.peak_lr = peak_lr
+        self.total_epochs = total_epochs
+        self.min_lr = min_lr
+
+    def __call__(self, step):
+        step = tf.cast(step, tf.float32)
+        t = tf.cast(self.total_epochs, tf.float32)
+        cosine = 0.5 * (1.0 + tf.cos(
+            tf.constant(np.pi, dtype=tf.float32) * step / tf.maximum(t, 1.0)
+        ))
+        return self.min_lr + (self.peak_lr - self.min_lr) * cosine
+
+    def get_config(self):
+        return {"peak_lr": self.peak_lr, "total_epochs": self.total_epochs,
+                "min_lr": self.min_lr}
+
+
+class CyclicCosineDecay(tf.keras.optimizers.schedules.LearningRateSchedule):
+    """Cosine Annealing with Warm Restarts.
+    每个周期: peak_lr → min_lr (cosine 衰减), 然后 restart 到新的 peak_lr。
+    每周期 peak_lr 乘以 cycle_decay 逐渐降低。
+    """
+
+    def __init__(self, peak_lr, cycle_period, min_lr_factor=0.01,
+                 cycle_decay=0.7):
+        super().__init__()
+        self.peak_lr = peak_lr
+        self.cycle_period = cycle_period
+        self.min_lr_factor = min_lr_factor
+        self.cycle_decay = cycle_decay
+
+    def __call__(self, step):
+        step = tf.cast(step, tf.float32)
+        period = tf.cast(self.cycle_period, tf.float32)
+        # 当前在第几个周期
+        cycle = tf.math.floordiv(step, period)
+        step_in_cycle = step - cycle * period
+        # 当前周期的 peak_lr
+        current_peak = self.peak_lr * (self.cycle_decay ** tf.cast(cycle, tf.float32))
+        min_lr = current_peak * self.min_lr_factor
+        cosine = 0.5 * (1.0 + tf.cos(
+            tf.constant(np.pi, dtype=tf.float32) * step_in_cycle / tf.maximum(period, 1.0)
+        ))
+        return min_lr + (current_peak - min_lr) * cosine
+
+    def get_config(self):
+        return {"peak_lr": self.peak_lr, "cycle_period": self.cycle_period,
+                "min_lr_factor": self.min_lr_factor, "cycle_decay": self.cycle_decay}
+
+
+class OneCycleDecay(tf.keras.optimizers.schedules.LearningRateSchedule):
+    """One-Cycle Policy: warmup 阶段 LR 线性升到 peak_lr, 然后 cosine 降到 min_lr。
+    warmup_prop: 上升阶段占总步数的比例 (典型值 0.3)。
+    """
+
+    def __init__(self, peak_lr, total_epochs, min_lr=1e-6, warmup_prop=0.3):
+        super().__init__()
+        self.peak_lr = peak_lr
+        self.total_epochs = total_epochs
+        self.min_lr = min_lr
+        self.warmup_prop = warmup_prop
+
+    def __call__(self, step):
+        step = tf.cast(step, tf.float32)
+        t = tf.cast(self.total_epochs, tf.float32)
+        warmup_steps = t * self.warmup_prop
+        warmup_lr = self.min_lr + (self.peak_lr - self.min_lr) * (step / tf.maximum(warmup_steps, 1.0))
+        decay_steps = t - warmup_steps
+        cosine = 0.5 * (1.0 + tf.cos(
+            tf.constant(np.pi, dtype=tf.float32) * (step - warmup_steps) / tf.maximum(decay_steps, 1.0)
+        ))
+        decay_lr = self.min_lr + (self.peak_lr - self.min_lr) * cosine
+        return tf.where(step < warmup_steps, warmup_lr, decay_lr)
+
+    def get_config(self):
+        return {"peak_lr": self.peak_lr, "total_epochs": self.total_epochs,
+                "min_lr": self.min_lr, "warmup_prop": self.warmup_prop}
+
+
+def _create_lr_schedule(cfg):
+    """根据 Config 创建学习率调度器。"""
+    name = cfg.lr_schedule
+    if name == "warmup_cosine":
+        return WarmupCosineDecay(
+            peak_lr=cfg.peak_lr, warmup_epochs=cfg.warmup_epochs,
+            total_epochs=cfg.total_epochs, min_lr=cfg.min_lr,
+        )
+    elif name == "cosine":
+        return CosineDecay(
+            peak_lr=cfg.peak_lr, total_epochs=cfg.total_epochs,
+            min_lr=cfg.min_lr,
+        )
+    elif name == "cyclic":
+        return CyclicCosineDecay(
+            peak_lr=cfg.peak_lr, cycle_period=cfg.lr_cycle_period,
+            min_lr_factor=cfg.lr_cycle_min_factor,
+            cycle_decay=cfg.lr_cycle_decay,
+        )
+    elif name == "one_cycle":
+        return OneCycleDecay(
+            peak_lr=cfg.peak_lr, total_epochs=cfg.total_epochs,
+            min_lr=cfg.min_lr,
+        )
+    else:
+        raise ValueError(f"未知的 lr_schedule: '{name}'。"
+                         f"可选: warmup_cosine, cosine, cyclic, one_cycle")
+
+
 # =============================================================================
-# 7. 训练流程 (简化版: 单阶段, 无 RAD)
+# 7. 训练流程 (支持 loss 平衡 / LR 调度器选择 / L-BFGS 精调)
 # =============================================================================
 def train_model(model, cfg: Config, params=None, diag=None):
-    """单阶段训练 — Warmup + Cosine，无 Stage/Round/RAD。"""
-    lr_schedule = WarmupCosineDecay(
-        peak_lr=cfg.peak_lr,
-        warmup_epochs=cfg.warmup_epochs,
-        total_epochs=cfg.total_epochs,
-        min_lr=cfg.min_lr,
-    )
+    """单阶段 Adam 训练 + 可选 L-BFGS 精调。"""
+
+    # ── 1. 学习率调度器 ────────────────────────────────────────────────────
+    lr_schedule = _create_lr_schedule(cfg)
     model.tf_optimizer = tf.keras.optimizers.legacy.Adam(lr_schedule, beta_1=0.99)
 
-    print(f"\n[Train] Warmup-Cosine: peak={cfg.peak_lr}, warmup={cfg.warmup_epochs}, "
+    print(f"\n[Train] LR schedule: {cfg.lr_schedule}, peak={cfg.peak_lr}, "
           f"total={cfg.total_epochs}, min={cfg.min_lr}")
+    if cfg.lr_schedule == "cyclic":
+        print(f"[Train]   cycle_period={cfg.lr_cycle_period}, "
+              f"decay={cfg.lr_cycle_decay}, min_factor={cfg.lr_cycle_min_factor}")
+
+    # ── 2. Loss 平衡 ────────────────────────────────────────────────────────
+    if cfg.loss_balance_mode == "fixed":
+        # 修改 FB 项的 adaptive_constant 初始权重
+        n_terms = model.adaptive_constant_func.adaptive_constant.shape[1]
+        new_weights = np.ones((1, n_terms), dtype=np.float32)
+        if n_terms >= 2:
+            new_weights[0, 1] = cfg.fb_loss_weight  # FB 项 (index 1)
+        model.adaptive_constant_func.adaptive_constant.assign(
+            tf.constant(new_weights)
+        )
+        print(f"[Train] Loss balance: fixed, FB weight={cfg.fb_loss_weight:.1e}")
+    elif cfg.loss_balance_mode == "auto":
+        print(f"[Train] Loss balance: auto (GradNorm), alpha={cfg.loss_balance_alpha}")
+    else:
+        print(f"[Train] Loss balance: none (equal weights)")
+
     print(f"[Train] Architecture: Act={cfg.Act}, residual={cfg.use_residual}, "
           f"layers={cfg.layer_sizes}")
 
+    # ── 3. Adam 训练阶段 ────────────────────────────────────────────────────
     # 初始快照
     if diag is not None and cfg.diag_enabled:
         diag.snapshot(0)
@@ -374,6 +532,14 @@ def train_model(model, cfg: Config, params=None, diag=None):
 
     if diag is not None and cfg.diag_enabled:
         diag.finalize()
+
+    # ── 4. L-BFGS 精调阶段 ──────────────────────────────────────────────────
+    if cfg.fine_tune_enabled:
+        print(f"\n[Fine-Tune] Starting L-BFGS fine-tuning "
+              f"({cfg.fine_tune_epochs} steps, eager={cfg.fine_tune_eager})...")
+        model.fit(tf_iter=0, newton_iter=cfg.fine_tune_epochs,
+                  newton_eager=cfg.fine_tune_eager, batch_sz=cfg.batch_size)
+        print(f"[Fine-Tune] Done. Final loss={model.loss_history[-1]:.2f}")
 
     return model
 
@@ -496,6 +662,63 @@ def plot_results(model, params, cfg: Config, save_prefix='result'):
     plt.close()
 
     print(f"figures saved to: {os.path.dirname(save_prefix)}")
+
+
+# =============================================================================
+# 8.5. 学习率曲线记录 & 绘图 (训练结束后自动调用)
+# =============================================================================
+def _compute_lr_curve(peak_lr, warmup_epochs, total_epochs, min_lr=1e-6,
+                      record_every=10):
+    """复现 WarmupCosineDecay 的学习率曲线，返回 (epochs, lrs)。"""
+    epochs_list = []
+    lrs_list = []
+    for step in range(1, total_epochs + 1):
+        if step < warmup_epochs:
+            lr = peak_lr * (step / max(warmup_epochs, 1))
+        else:
+            decay_steps = total_epochs - warmup_epochs
+            cosine = 0.5 * (1.0 + np.cos(
+                np.pi * (step - warmup_epochs) / max(decay_steps, 1)
+            ))
+            lr = min_lr + (peak_lr - min_lr) * cosine
+        if step % record_every == 0 or step == 1:
+            epochs_list.append(step)
+            lrs_list.append(float(lr))
+    return epochs_list, lrs_list
+
+
+def _plot_lr_curve(epochs, lrs, figures_dir, cfg, dpi=300):
+    """绘制学习率曲线 (线性 + 对数坐标) 并保存到 figures/ 目录。"""
+    fig, axes = plt.subplots(2, 1, figsize=(12, 10), dpi=150)
+    fig.suptitle(
+        f"Learning Rate Schedule  (C{getattr(cfg, 'config_id', '?')})\n"
+        f"peak={cfg.peak_lr:.0e}, min={cfg.min_lr:.0e}, "
+        f"warmup={cfg.warmup_epochs}, total={cfg.total_epochs}",
+        fontsize=16,
+    )
+
+    for ax, yscale, title in [
+        (axes[0], 'linear', 'Linear Scale'),
+        (axes[1], 'log',    'Log Scale'),
+    ]:
+        ax.plot(epochs, lrs, 'b-', lw=0.8)
+        ax.axvline(cfg.warmup_epochs, color='gray', ls='--', lw=1, alpha=0.7,
+                   label=f'warmup end ({cfg.warmup_epochs})')
+        ax.set_xlabel('Epoch', fontsize=14)
+        ax.set_ylabel('Learning Rate', fontsize=14)
+        ax.set_title(title, fontsize=14)
+        ax.legend(fontsize=12)
+        ax.grid(True, alpha=0.3)
+        ax.tick_params(labelsize=12)
+        if yscale == 'log':
+            ax.set_yscale('log')
+
+    fig.tight_layout()
+    save_path = os.path.join(figures_dir, 'learning_rate_schedule.png')
+    fig.savefig(save_path, dpi=dpi, bbox_inches='tight', pad_inches=0.1)
+    plt.close(fig)
+    print(f"[LR] 学习率曲线图保存至: {save_path}")
+
 
 # =============================================================================
 # 9. 主程序
@@ -630,15 +853,28 @@ def main(config_id=1):
 
     # 保存 loss history 为 JSON
     loss_json_path = os.path.join(log_dir, 'loss_history.json')
+    loss_data = {
+        'loss_history': [float(v) if hasattr(v, 'numpy') else v
+                         for v in model.loss_history],
+        'epoch_history': model.epoch_history,
+        'loss_all_history': [[float(vv) if hasattr(vv, 'numpy') else vv
+                              for vv in v] for v in model.loss_all_history],
+    }
+    # ── 记录学习率曲线 ──────────────────────────────────────────────────────
+    lr_epochs, lr_values = _compute_lr_curve(
+        peak_lr=cfg.peak_lr,
+        warmup_epochs=cfg.warmup_epochs,
+        total_epochs=cfg.total_epochs,
+        min_lr=cfg.min_lr,
+        record_every=10,
+    )
+    loss_data['lr_history'] = lr_values
     with open(loss_json_path, 'w') as f:
-        json.dump({
-            'loss_history': [float(v) if hasattr(v, 'numpy') else v
-                             for v in model.loss_history],
-            'epoch_history': model.epoch_history,
-            'loss_all_history': [[float(vv) if hasattr(vv, 'numpy') else vv
-                                  for vv in v] for v in model.loss_all_history],
-        }, f, indent=2)
+        json.dump(loss_data, f, indent=2)
     print(f"Loss history saved to: {loss_json_path}")
+
+    # ── 绘制学习率曲线 ──────────────────────────────────────────────────────
+    _plot_lr_curve(lr_epochs, lr_values, figures_dir, cfg, dpi=cfg.dpi_save)
 
     # 可视化结果保存到 figures/
     fig_prefix = os.path.join(figures_dir, model_name)
