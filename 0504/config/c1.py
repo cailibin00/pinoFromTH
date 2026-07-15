@@ -62,7 +62,7 @@ class Config(BaseConfig):
     # ========== L-BFGS 精调 ==========
     fine_tune_enabled = False
     fine_tune_epochs = 1000
-    fine_tune_eager = True
+    fine_tune_eager = False
 
     # ========== 诊断 ==========
     diag_enabled = True

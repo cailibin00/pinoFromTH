@@ -79,6 +79,6 @@ class Config(BaseConfig):
     # 推荐: True + fine_tune_epochs=1000（Adam落地后精调边界）
     fine_tune_enabled = True
     fine_tune_epochs = 1000
-    fine_tune_eager = True
+    fine_tune_eager = False
 
 

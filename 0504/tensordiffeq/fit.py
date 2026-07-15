@@ -79,15 +79,28 @@ def fit(obj, tf_iter=0, newton_iter=0, newton_eager=False):
         print("Starting L-BFGS training")
         if newton_eager:
             print("Executing eager-mode L-BFGS")
+            from .utils import set_weights as _set_weights_eager
             loss_and_flat_grad = obj.get_loss_and_flat_grad()
-            x, f_hist, currentFuncEval,loss_history,epoch_history,loss_all_history,PCGrad_COS_history,PCGrad_GMS_history=eager_lbfgs(loss_and_flat_grad,
-                        get_weights(obj.u_model),
-                        Struct(),obj.PCGrad_COS_GMS, maxIter=newton_iter+1, learningRate=0.8)#0.8
-            obj.loss_history = obj.loss_history+loss_history
-            obj.epoch_history = obj.epoch_history+list(np.array(epoch_history)+obj.epoch_history[-1])
-            obj.loss_all_history = obj.loss_all_history + loss_all_history
-            obj.PCGrad_COS_history = obj.PCGrad_COS_history+PCGrad_COS_history
-            obj.PCGrad_GMS_history = obj.PCGrad_GMS_history+PCGrad_GMS_history
+            # eager_lbfgs(opfunc, x, state, maxIter, learningRate, do_verbose)
+            # 返回: (x_opt, f_hist, currentFuncEval) 或 (x_opt, f_hist) for early-exit
+            result = eager_lbfgs(
+                loss_and_flat_grad,
+                get_weights(obj.u_model),
+                Struct(),
+                maxIter=newton_iter + 1,
+                learningRate=0.8,
+            )
+            if len(result) == 2:
+                x_opt, f_hist = result
+            else:
+                x_opt, f_hist, _ = result
+            # 将优化后的参数写回模型
+            _set_weights_eager(obj.u_model, x_opt, obj.sizes_w, obj.sizes_b)
+            # 记录 L-BFGS 迭代中的 loss 历史 (f_hist 是每次迭代的 loss)
+            for fi in f_hist:
+                obj.loss_history.append(float(fi) if hasattr(fi, 'numpy') else fi)
+                obj.epoch_history.append(obj.epoch_history[-1] + 1)
+                obj.loss_all_history.append([float(fi), 0.0])
         else:
             print("Executing graph-mode L-BFGS\n Building graph...")
             print("Warning: Depending on your CPU/GPU setup, eager-mode L-BFGS may prove faster. If the computational "

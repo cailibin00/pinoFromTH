@@ -130,7 +130,7 @@ class Config:
     # ========== L-BFGS 精调 (可配置) ==========
     fine_tune_enabled = False     # Adam 训练结束后是否运行 L-BFGS 精调
     fine_tune_epochs = 1000       # L-BFGS 迭代步数 (推荐: 500~2000)
-    fine_tune_eager = True        # True=eager模式 (快), False=graph模式
+    fine_tune_eager = False       # True=eager模式 (有get_weights修复), False=graph模式 (推荐, 更稳健)
 
     # 诊断参数
     diag_enabled = True         # 是否启用训练诊断
@@ -480,61 +480,69 @@ def _create_lr_schedule(cfg):
 # =============================================================================
 # 7. 训练流程 (支持 loss 平衡 / LR 调度器选择 / L-BFGS 精调)
 # =============================================================================
-def train_model(model, cfg: Config, params=None, diag=None):
-    """单阶段 Adam 训练 + 可选 L-BFGS 精调。"""
+def train_model(model, cfg: Config, params=None, diag=None, skip_adam=False):
+    """单阶段 Adam 训练 + 可选 L-BFGS 精调。
+    skip_adam=True 时跳过 Adam，直接进入 L-BFGS（用于断点续训）。
+    """
 
-    # ── 1. 学习率调度器 ────────────────────────────────────────────────────
-    lr_schedule = _create_lr_schedule(cfg)
-    model.tf_optimizer = tf.keras.optimizers.legacy.Adam(lr_schedule, beta_1=0.99)
+    if not skip_adam:
+        # ── 1. 学习率调度器 ────────────────────────────────────────────────
+        lr_schedule = _create_lr_schedule(cfg)
+        model.tf_optimizer = tf.keras.optimizers.legacy.Adam(lr_schedule, beta_1=0.99)
 
-    print(f"\n[Train] LR schedule: {cfg.lr_schedule}, peak={cfg.peak_lr}, "
-          f"total={cfg.total_epochs}, min={cfg.min_lr}")
-    if cfg.lr_schedule == "cyclic":
-        print(f"[Train]   cycle_period={cfg.lr_cycle_period}, "
-              f"decay={cfg.lr_cycle_decay}, min_factor={cfg.lr_cycle_min_factor}")
+        print(f"\n[Train] LR schedule: {cfg.lr_schedule}, peak={cfg.peak_lr}, "
+              f"total={cfg.total_epochs}, min={cfg.min_lr}")
+        if cfg.lr_schedule == "cyclic":
+            print(f"[Train]   cycle_period={cfg.lr_cycle_period}, "
+                  f"decay={cfg.lr_cycle_decay}, min_factor={cfg.lr_cycle_min_factor}")
 
-    # ── 2. Loss 平衡 ────────────────────────────────────────────────────────
-    if cfg.loss_balance_mode == "fixed":
-        # 修改 FB 项的 adaptive_constant 初始权重
-        n_terms = model.adaptive_constant_func.adaptive_constant.shape[1]
-        new_weights = np.ones((1, n_terms), dtype=np.float32)
-        if n_terms >= 2:
-            new_weights[0, 1] = cfg.fb_loss_weight  # FB 项 (index 1)
-        model.adaptive_constant_func.adaptive_constant.assign(
-            tf.constant(new_weights)
-        )
-        print(f"[Train] Loss balance: fixed, FB weight={cfg.fb_loss_weight:.1e}")
-    elif cfg.loss_balance_mode == "auto":
-        print(f"[Train] Loss balance: auto (GradNorm), alpha={cfg.loss_balance_alpha}")
+        # ── 2. Loss 平衡 ────────────────────────────────────────────────────
+        if cfg.loss_balance_mode == "fixed":
+            n_terms = model.adaptive_constant_func.adaptive_constant.shape[1]
+            new_weights = np.ones((1, n_terms), dtype=np.float32)
+            if n_terms >= 2:
+                new_weights[0, 1] = cfg.fb_loss_weight
+            model.adaptive_constant_func.adaptive_constant.assign(
+                tf.constant(new_weights)
+            )
+            print(f"[Train] Loss balance: fixed, FB weight={cfg.fb_loss_weight:.1e}")
+        elif cfg.loss_balance_mode == "auto":
+            print(f"[Train] Loss balance: auto (GradNorm), alpha={cfg.loss_balance_alpha}")
+        else:
+            print(f"[Train] Loss balance: none (equal weights)")
+
+        print(f"[Train] Architecture: Act={cfg.Act}, residual={cfg.use_residual}, "
+              f"layers={cfg.layer_sizes}")
+
+        # ── 3. Adam 训练阶段 ────────────────────────────────────────────────
+        if diag is not None and cfg.diag_enabled:
+            diag.snapshot(0)
+
+        remaining = cfg.total_epochs
+        global_epoch = 0
+
+        while remaining > 0:
+            chunk = min(cfg.diag_interval, remaining) if cfg.diag_enabled else remaining
+            model.fit(tf_iter=chunk, newton_iter=0, batch_sz=cfg.batch_size)
+            global_epoch += chunk
+            remaining -= chunk
+            print(f"  epoch {global_epoch}/{cfg.total_epochs}, loss={model.loss_history[-1]:.2f}")
+
+            if diag is not None and cfg.diag_enabled and remaining > 0:
+                diag.snapshot(global_epoch)
+
+        if diag is not None and cfg.diag_enabled:
+            diag.finalize()
     else:
-        print(f"[Train] Loss balance: none (equal weights)")
-
-    print(f"[Train] Architecture: Act={cfg.Act}, residual={cfg.use_residual}, "
-          f"layers={cfg.layer_sizes}")
-
-    # ── 3. Adam 训练阶段 ────────────────────────────────────────────────────
-    # 初始快照
-    if diag is not None and cfg.diag_enabled:
-        diag.snapshot(0)
-
-    remaining = cfg.total_epochs
-    global_epoch = 0
-
-    while remaining > 0:
-        chunk = min(cfg.diag_interval, remaining) if cfg.diag_enabled else remaining
-        model.fit(tf_iter=chunk, newton_iter=0, batch_sz=cfg.batch_size)
-        global_epoch += chunk
-        remaining -= chunk
-        print(f"  epoch {global_epoch}/{cfg.total_epochs}, loss={model.loss_history[-1]:.2f}")
-
-        if diag is not None and cfg.diag_enabled and remaining > 0:
-            diag.snapshot(global_epoch)
-
-    if diag is not None and cfg.diag_enabled:
-        diag.finalize()
+        print("\n[Resume] 跳过 Adam 训练，从已保存权重恢复...")
 
     # ── 4. L-BFGS 精调阶段 ──────────────────────────────────────────────────
     if cfg.fine_tune_enabled:
+        # 确保模型状态正确 (resume 后 optimizer 可能未初始化)
+        if skip_adam:
+            # 为 L-BFGS 准备一个 dummy optimizer（仅用于兼容性）
+            dummy_lr = _create_lr_schedule(cfg)
+            model.tf_optimizer = tf.keras.optimizers.legacy.Adam(dummy_lr, beta_1=0.99)
         print(f"\n[Fine-Tune] Starting L-BFGS fine-tuning "
               f"({cfg.fine_tune_epochs} steps, eager={cfg.fine_tune_eager})...")
         model.fit(tf_iter=0, newton_iter=cfg.fine_tune_epochs,
@@ -723,7 +731,7 @@ def _plot_lr_curve(epochs, lrs, figures_dir, cfg, dpi=300):
 # =============================================================================
 # 9. 主程序
 # =============================================================================
-def main(config_id=1):
+def main(config_id=1, resume=False, resume_path=None):
     # 初始化配置 — 从 config/ 目录按序号加载
     from config import get_config
     cfg = get_config(config_id)
@@ -828,7 +836,32 @@ def main(config_id=1):
 
     # 最佳模型保存到 checkpoints/
     model.best_weights_path = os.path.join(ckpt_dir, 'epochs_best_model')
-    model.u_model.save_weights(model.best_weights_path)
+
+    # ---- 断点续训: 加载已保存权重 ----
+    skip_adam = False
+    if resume:
+        load_path = resume_path if resume_path else model.best_weights_path
+        if not os.path.exists(load_path + ".index") and not os.path.exists(load_path + ".data-00000-of-00001"):
+            # 尝试 TF checkpoint 格式
+            if os.path.exists(os.path.dirname(load_path)):
+                ckpt_files = os.listdir(os.path.dirname(load_path))
+                if ckpt_files:
+                    print(f"[Resume] checkpoint 目录内容: {ckpt_files}")
+            raise FileNotFoundError(
+                f"[Resume] 找不到模型权重: {load_path}\n"
+                f"  请确认权重文件存在于: {os.path.dirname(load_path)}"
+            )
+        model.u_model.load_weights(load_path)
+        print(f"[Resume] 成功加载已训练权重: {load_path}")
+        skip_adam = True
+
+        # 如果用户没开 fine_tune，提示
+        if not cfg.fine_tune_enabled:
+            print("[Resume] 警告: fine_tune_enabled=False，将不会进行 L-BFGS 精调。")
+            print("[Resume] 仅完成权重加载。如需精调，请在 config 中设置 fine_tune_enabled=True。")
+    else:
+        # 正常训练：初始化保存初始权重
+        model.u_model.save_weights(model.best_weights_path)
 
     # ---- 初始化诊断 ----
     diag = None
@@ -836,8 +869,8 @@ def main(config_id=1):
         diag = TrainingDiagnostics(model, params, cfg, output_dir)
 
     # 训练
-    print("Starting training...")
-    model = train_model(model, cfg, params=params, diag=diag)
+    print("Starting training..." if not skip_adam else "Starting fine-tuning...")
+    model = train_model(model, cfg, params=params, diag=diag, skip_adam=skip_adam)
 
     # ---- 训练后诊断 ----
     if cfg.diag_enabled:
@@ -893,5 +926,11 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Reynolds PINN 训练")
     parser.add_argument("config_id", nargs="?", type=int, default=1,
                         help="配置序号 (对应 config/cN.py)，默认 1")
+    parser.add_argument("--resume", action="store_true", default=False,
+                        help="从 checkpoints/epochs_best_model 恢复权重，"
+                             "跳过 Adam 训练，直接进入 L-BFGS 精调")
+    parser.add_argument("--resume-path", type=str, default=None,
+                        help="指定权重恢复路径 (覆盖默认的 checkpoints/epochs_best_model)")
     args = parser.parse_args()
-    model = main(config_id=args.config_id)
+    model = main(config_id=args.config_id, resume=args.resume,
+                 resume_path=args.resume_path)
