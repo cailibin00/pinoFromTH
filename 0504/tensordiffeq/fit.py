@@ -107,7 +107,11 @@ def fit(obj, tf_iter=0, newton_iter=0, newton_eager=False):
                   "graph takes a long time to build, or the computation is slow, try eager-mode L-BFGS (enabled by "
                   "default)")
 
-            obj.optim_results=lbfgs_train(obj, newton_iter)
+            f_hist = lbfgs_train(obj, newton_iter)
+            for fi in f_hist:
+                obj.loss_history.append(float(fi) if hasattr(fi, 'numpy') else fi)
+                obj.epoch_history.append(obj.epoch_history[-1] + 1)
+                obj.loss_all_history.append([float(fi), 0.0])
 
     # tf.profiler.experimental.stop()
 
@@ -119,6 +123,7 @@ def lbfgs_train(obj, newton_iter):
     init_params = tf.dynamic_stitch(func.idx, obj.u_model.trainable_variables)
 
     lbfgs_op(func, init_params, newton_iter)
+    return func.history
 
 
 @tf.function

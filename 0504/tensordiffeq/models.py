@@ -249,7 +249,8 @@ class CollocationSolverND:
         #loss_total = tf.reduce_sum(tf.math.multiply(loss_all, self.adaptive_constant_func.adaptive_constant))  # self.adaptive_constant
         loss_total = self.adaptive_constant_func.adaptive_constant[0][0] * loss_all[0] \
                      + tf.reduce_sum(tf.math.multiply(loss_all[1:], self.adaptive_constant_func.adaptive_constant[0][1:]))
-        return loss_total,loss_all #lbfgs-graph ,后面输出省略，否则不省略
+        self._last_loss_all = loss_all
+        return loss_total  # 只返回标量，graph-LBFGS 需要标量 loss
 
 
     def update_loss_seperate(self):
@@ -704,14 +705,14 @@ class CollocationSolverND:
         def loss_and_flat_grad(w):
             with tf.GradientTape() as tape:
                 set_weights(self.u_model, w, self.sizes_w, self.sizes_b)
-                loss_value, loss_all = self.update_loss()#
+                loss_value = self.update_loss()
 
             grad = tape.gradient(loss_value, self.u_model.trainable_variables)
             grad_flat = []
             for g in grad:
                 grad_flat.append(tf.reshape(g, [-1]))
             grad_flat = tf.concat(grad_flat, 0)
-            return loss_value, grad_flat , loss_all
+            return loss_value, grad_flat
 
         return loss_and_flat_grad
 
