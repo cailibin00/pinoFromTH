@@ -1,13 +1,17 @@
 """
 FEM vs PINN 对比分析脚本
 ================================================
-直接运行即可，无需命令行参数。
+用法:
+    python compare_fem_pinn_iso_v16.py          # 默认使用 config_id=1
+    python compare_fem_pinn_iso_v16.py 3        # 使用 config/c3.py 的配置
+
 所有路径自动根据本脚本所在目录确定。
 
 依赖：reynolds_pinn.py 与本脚本放在同一目录。
 """
 
 import os
+import sys
 import argparse
 import numpy as np
 import matplotlib.pyplot as plt
@@ -15,9 +19,9 @@ import matplotlib.ticker as ticker
 from matplotlib import cm
 import tensorflow as tf
 
-# ── 从主 PINN 文件导入配置与辅助函数 ──────────────────────────────────────────
+# ── 从主 PINN 文件导入辅助函数，从 config 加载配置 ────────────────────────────
+from config import get_config
 from reynold_pinn import (
-    Config,
     compute_physical_params,
     create_H_func,
 )
@@ -33,16 +37,12 @@ def _p(filename):
     """拼接脚本目录与文件名"""
     return os.path.join(_HERE, filename)
 
-class Args:
-    model_path = os.path.join(_HERE, Config.output_dir, "checkpoints", "epochs_best_model")
-    fem_p      = _p("p_FBNS.txt")
-    fem_g      = _p("g_FBNS.txt")
-    out_dir    = os.path.join(_HERE, Config.output_dir, "comparison_results")
-    n_grid     = 201
-    dpi        = 300
-
 def parse_args():
-    return Args()
+    parser = argparse.ArgumentParser(description="FEM vs PINN 对比分析")
+    parser.add_argument("config_id", nargs="?", type=int, default=1,
+                        help="配置序号 (对应 config/cN.py)，默认 1")
+    parser.add_argument("--dpi", type=int, default=300, help="图片 DPI")
+    return parser.parse_args()
 
 
 # =============================================================================
@@ -90,7 +90,7 @@ def load_fem(fem_p_path: str, fem_g_path: str):
 # =============================================================================
 # 2. 加载 PINN 模型并推理
 # =============================================================================
-def load_pinn_and_predict(model_path: str, coords: np.ndarray, cfg: Config, params: dict):
+def load_pinn_and_predict(model_path: str, coords: np.ndarray, cfg, params: dict):
     """
     加载已保存的 PINN 权重，在 coords (N,2) 上推理。
 
@@ -707,25 +707,35 @@ def save_metrics(metrics: dict, out_dir: str):
 # =============================================================================
 def main():
     args = parse_args()
-    os.makedirs(args.out_dir, exist_ok=True)
+    cfg = get_config(args.config_id)
+    print(f"[Config] 加载配置 C{args.config_id}: Act={cfg.Act}, residual={cfg.use_residual}, "
+          f"output={cfg.output_dir}")
 
-    cfg    = Config()
+    # ── 根据 config 推导路径 ──────────────────────────────────────────────────
+    model_path = os.path.join(_HERE, cfg.output_dir, "checkpoints", "epochs_best_model")
+    out_dir    = os.path.join(_HERE, cfg.output_dir, "comparison_results")
+    fem_p      = _p("p_FBNS.txt")
+    fem_g      = _p("g_FBNS.txt")
+    dpi        = args.dpi
+
+    os.makedirs(out_dir, exist_ok=True)
+
     params = compute_physical_params(cfg)
 
     # ── 读取 FEM ──────────────────────────────────────────────────────────────
     print("\n[1/4] 读取 FEM 数据...")
     (R_pts, T_pts, P_fem, G_fem,
      P_fem_grid, G_fem_grid,
-     R_uniq, T_uniq) = load_fem(args.fem_p, args.fem_g)
+     R_uniq, T_uniq) = load_fem(fem_p, fem_g)
 
     # ── PINN 推理 ─────────────────────────────────────────────────────────────
     print("\n[2/4] 加载 PINN 并推理...")
     coords = np.stack([R_pts, T_pts], axis=1).astype(np.float32)
     P_pinn, G_pinn = load_pinn_and_predict(
-        args.model_path, coords, cfg, params
+        model_path, coords, cfg, params
     )
 
-    
+
     # 整形为网格（与 FEM 一致：行=R，列=theta）
     nR, nT       = len(R_uniq), len(T_uniq)
     P_pinn_grid  = P_pinn.reshape(nR, nT)
@@ -735,50 +745,49 @@ def main():
     print("\n[3/4] 计算误差指标...")
     metrics = compute_metrics(P_fem, G_fem, P_pinn, G_pinn)
     print_metrics(metrics)
-    save_metrics(metrics, args.out_dir)
+    save_metrics(metrics, out_dir)
 
     # ── 可视化 ────────────────────────────────────────────────────────────────
     print("\n[4/4] 生成对比图...")
-    dpi = args.dpi
 
     plot_field_comparison(R_uniq, T_uniq,
                           P_fem_grid, G_fem_grid,
                           P_pinn_grid, G_pinn_grid,
-                          args.out_dir, dpi)
+                          out_dir, dpi)
 
     plot_error_maps(R_uniq, T_uniq,
                     P_fem_grid, G_fem_grid,
                     P_pinn_grid, G_pinn_grid,
-                    args.out_dir, dpi)
+                    out_dir, dpi)
 
     plot_cavitation_boundary(R_uniq, T_uniq,
                               G_fem_grid, G_pinn_grid,
-                              args.out_dir, dpi)
+                              out_dir, dpi)
 
     plot_pressure_contour_overlay(R_uniq, T_uniq,
                                    P_fem_grid, P_pinn_grid,
-                                   args.out_dir, dpi)
+                                   out_dir, dpi)
 
     plot_profiles(R_uniq, T_uniq,
                   P_fem_grid, G_fem_grid,
                   P_pinn_grid, G_pinn_grid,
-                  args.out_dir, dpi)
+                  out_dir, dpi)
 
     plot_periodic_check(R_uniq, T_uniq,
                          P_fem_grid, P_pinn_grid,
                          G_fem_grid, G_pinn_grid,
-                         args.out_dir, dpi)
+                         out_dir, dpi)
 
-    plot_scatter_correlation(P_fem, G_fem, P_pinn, G_pinn, args.out_dir, dpi)
+    plot_scatter_correlation(P_fem, G_fem, P_pinn, G_pinn, out_dir, dpi)
 
-    plot_jfo_complement(P_pinn, G_pinn, P_fem, G_fem, args.out_dir, dpi)
+    plot_jfo_complement(P_pinn, G_pinn, P_fem, G_fem, out_dir, dpi)
 
     plot_cavitation_isoline(R_uniq, T_uniq,
                              G_fem_grid, G_pinn_grid,
-                             args.out_dir, dpi,
+                             out_dir, dpi,
                              iso_level=0.5)
 
-    print(f"\n完成！所有结果保存至: {os.path.abspath(args.out_dir)}\n")
+    print(f"\n完成！所有结果保存至: {os.path.abspath(out_dir)}\n")
 
 
 if __name__ == "__main__":
