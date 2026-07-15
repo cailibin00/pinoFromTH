@@ -41,7 +41,7 @@ class Config(BaseConfig):
     coslayer_mode = "mlp"
 
     # ========== 训练参数 ==========
-    layer_sizes = [2, 128, 128, 256, 128, 128, 2]
+    layer_sizes = [2, 128, 128,256,256, 128, 128, 2]
     total_epochs = 30000
     warmup_epochs = 1000
     peak_lr = 1e-3
@@ -53,7 +53,7 @@ class Config(BaseConfig):
     diag_interval = 1000
 
     # ========== 输出 ==========
-    output_dir = "output_resF_silu_small"
+    output_dir = "output_resF_silu_small_epoch30000"
     device = "5"
 
     # ========== 绘图 ==========
@@ -64,7 +64,7 @@ class Config(BaseConfig):
 
     # ========== 学习率调度器 ==========
     # 推荐: "cyclic"（对此问题loss景观崎岖效果好）| "warmup_cosine"（稳定baseline）
-    lr_schedule = "warmup_cosine"  # warmup_cosine | cyclic | cosine | one_cycle
+    lr_schedule = "cyclic"  # warmup_cosine | cyclic | cosine | one_cycle
     lr_cycle_period = 5000  # 每 5000 epochs restart
     lr_cycle_decay = 0.7    # 每次 restart peak_lr 降为 70%
     lr_cycle_min_factor = 0.01
