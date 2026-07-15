@@ -347,7 +347,7 @@ class CollocationSolverND:
                                 msq = MSE(bc.val, target)
                                 loss_bc = tf.math.add(loss_bc, msq)
 
-            elif bc.isDirichlect:
+            elif bc.isDirichlet:
 
                 if (self.two_output == True):
                     #self.bc_loss_temp = self.u_model(bc.input)[0]
@@ -398,7 +398,7 @@ class CollocationSolverND:
         #loss_bcs_2 = 0.
         for counter_bc, bc in enumerate(self.bcs):  # 一个边界条件一个边界条件来
 
-            if bc.isDirichlect:
+            if bc.isDirichlet:
                     loss_bc_2 = MSE(tf.reshape(self.u_model(bc.input)[1], [-1, 1]),0)###1,0  # 这个是均匀过的###################################
                     #loss_bc_2 = -   tf.stop_gradient(tf.math.sign(tf.reshape(self.u_model(bc.input)[0], [-1, 1])) / 2 + 1 / 2) * tf.math.log(tf.reshape(self.u_model(bc.input)[1], [-1, 1])) \
                              #- (1 - tf.stop_gradient(tf.math.sign(tf.reshape(self.u_model(bc.input)[0], [-1, 1])) / 2 + 1 / 2)) * tf.math.log(1 - tf.reshape(self.u_model(bc.input)[1], [-1, 1]))
@@ -477,7 +477,7 @@ class CollocationSolverND:
                                 msq = MSE(bc.val, target)
                                 loss_bc = tf.math.add(loss_bc, msq)
 
-            elif bc.isDirichlect:
+            elif bc.isDirichlet:
                 if isBC_adaptive:
                     loss_bc = MSE(self.u_model(bc.input), bc.val, self.lambdas[idx_lambda_bcs])
                     idx_lambda_bcs += 1
