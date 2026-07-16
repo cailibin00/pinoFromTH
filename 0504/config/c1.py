@@ -58,6 +58,7 @@ class Config(BaseConfig):
     # ========== Loss 平衡 ==========
     loss_balance_mode = "none"
     fb_loss_weight = 1.0
+    p_gamma_loss_weight = 1.0
     loss_balance_alpha = 0.2
 
     # ========== Reynolds 损失缩放 (缩小 PDE 残差项) ==========

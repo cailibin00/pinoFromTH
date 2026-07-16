@@ -212,8 +212,10 @@ class CollocationSolverND:
         #####################################一值和二值的关联############################################
         if (self.two_output==True):
            loss_g_all = self.update_loss_JFO_term_interact()
+           loss_pg_all = self.update_loss_P_times_gamma()
            loss_bcs_2 = self.update_loss_JFO_second_term_BCs()
            loss_all.append(loss_g_all)
+           loss_all.append(loss_pg_all)
            loss_all = loss_all + loss_bcs_2
 
         #雷诺边界条件#这个方法效果不好
@@ -248,7 +250,9 @@ class CollocationSolverND:
         #####################################一值和二值的关联############################################
         if (self.two_output==True):
            loss_g_all = self.update_loss_JFO_term_interact()
+           loss_pg_all = self.update_loss_P_times_gamma()
            loss_all.append(loss_g_all)
+           loss_all.append(loss_pg_all)
            #loss_g_all_2 = self.update_loss_JFO_term_interact_2()
            #loss_all.append(loss_g_all_2)
            #loss_bcs_2 = self.update_loss_JFO_second_term_BCs()
@@ -354,6 +358,19 @@ class CollocationSolverND:
             loss_g_all = tf.math.add(loss_g, loss_g_all)
 
         return loss_g_all
+
+    def update_loss_P_times_gamma(self):
+        loss_pg_all = 0.
+        u_preds = self.u_model(self.domain.X_f)
+
+        if not isinstance(u_preds, tuple):
+            u_preds = u_preds,
+        for u_pred in u_preds:
+            p, gamma = u_pred[0], u_pred[1]
+            loss_pg = tf.reduce_mean(tf.square(p * gamma))
+            loss_pg_all = tf.math.add(loss_pg, loss_pg_all)
+
+        return loss_pg_all
 
     def update_loss_JFO_term_interact_2(self):
         loss_g_all = 0.

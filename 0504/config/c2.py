@@ -74,6 +74,7 @@ class Config(BaseConfig):
     # 推荐: "fixed" + fb_loss_weight=1000（JFO 问题 FB 项需要强加权）
     loss_balance_mode = "fixed"
     fb_loss_weight = 1 # fb权重
+    p_gamma_loss_weight = 1e3 # P*gamma 互补乘积权重
     loss_balance_alpha = 0.2 # auto 模式下 EMA 平滑系数
 
     # ========== Reynolds 损失缩放 (缩小 PDE 残差项) ==========
@@ -89,4 +90,3 @@ class Config(BaseConfig):
     fine_tune_enabled = False
     fine_tune_epochs = 1000
     fine_tune_eager = False
-

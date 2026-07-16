@@ -205,12 +205,19 @@ def compute_metrics(P_fem, G_fem, P_pinn, G_pinn):
     metrics["complementarity_violation"] = float(np.max(P_pinn * G_pinn))
 
     # ── 空化区域重叠（Dice / IoU） ────────────────────────────────────────────
-    mask_cav_pinn = G_pinn > 1e-6
-    intersection  = (mask_cav & mask_cav_pinn).sum()
-    union         = (mask_cav | mask_cav_pinn).sum()
-    sum_both      = mask_cav.sum() + mask_cav_pinn.sum()
-    metrics["cavitation_IoU"]  = intersection / (union + eps)
-    metrics["cavitation_Dice"] = 2 * intersection / (sum_both + eps)
+    cav_thresholds = [1e-6, 1e-4, 1e-3, 1e-2, 5e-2, 1e-1]
+    for th in cav_thresholds:
+        mask_cav_th = G_fem > th
+        mask_cav_pinn = G_pinn > th
+        intersection = (mask_cav_th & mask_cav_pinn).sum()
+        union = (mask_cav_th | mask_cav_pinn).sum()
+        sum_both = mask_cav_th.sum() + mask_cav_pinn.sum()
+        suffix = f"{th:.0e}".replace("-", "m")
+        metrics[f"cavitation_IoU_gt_{suffix}"] = intersection / (union + eps)
+        metrics[f"cavitation_Dice_gt_{suffix}"] = 2 * intersection / (sum_both + eps)
+
+    metrics["cavitation_IoU"] = metrics["cavitation_IoU_gt_1em06"]
+    metrics["cavitation_Dice"] = metrics["cavitation_Dice_gt_1em06"]
 
     # ── 周期边界一致性（FEM 应自动满足，PINN 需验证） ────────────────────────
     # 检查 PINN 在 theta=0 与 theta=theta_max 行的差异
@@ -232,6 +239,14 @@ def print_metrics(metrics: dict):
         ("空化区域形状", ["cavitation_IoU", "cavitation_Dice"]),
         ("JFO 互补条件", ["complementarity_violation"]),
     ]
+    groups[4] = ("Cavitation shape", [
+        "cavitation_IoU_gt_1em06", "cavitation_Dice_gt_1em06",
+        "cavitation_IoU_gt_1em04", "cavitation_Dice_gt_1em04",
+        "cavitation_IoU_gt_1em03", "cavitation_Dice_gt_1em03",
+        "cavitation_IoU_gt_1em02", "cavitation_Dice_gt_1em02",
+        "cavitation_IoU_gt_5em02", "cavitation_Dice_gt_5em02",
+        "cavitation_IoU_gt_1em01", "cavitation_Dice_gt_1em01",
+    ])
     for title, keys in groups:
         print(f"\n  {title}")
         for k in keys:

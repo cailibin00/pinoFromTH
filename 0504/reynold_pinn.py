@@ -122,6 +122,7 @@ class Config:
     #   auto:  基于梯度量级的自适应权重 (GradNorm风格)
     loss_balance_mode = "none"
     fb_loss_weight = 1.0          # fixed 模式下的 FB 项权重 (推荐: 100~10000)
+    p_gamma_loss_weight = 1.0     # weight for mean((P * gamma)^2)
     loss_balance_alpha = 0.2      # auto 模式下的 EMA 平滑系数
 
     # ========== Reynolds 损失缩放 (缩小 PDE 残差项) ==========
@@ -565,6 +566,8 @@ def train_model(model, cfg: Config, params=None, diag=None, skip_adam=False):
             new_weights = np.ones((1, n_terms), dtype=np.float32)
             if n_terms >= 2:
                 new_weights[0, 1] = cfg.fb_loss_weight
+            if n_terms >= 3:
+                new_weights[0, 2] = cfg.p_gamma_loss_weight
             # 应用 Reynolds 缩放权重
             if cfg.reynolds_weight_mode == "fixed":
                 new_weights[0, 0] = cfg.reynolds_loss_weight
@@ -575,6 +578,7 @@ def train_model(model, cfg: Config, params=None, diag=None, skip_adam=False):
                 tf.constant(new_weights)
             )
             print(f"[Train] Loss balance: fixed, FB weight={cfg.fb_loss_weight:.1e}, "
+                  f"P*gamma weight={cfg.p_gamma_loss_weight:.1e}, "
                   f"Reynolds mode={cfg.reynolds_weight_mode}")
         elif cfg.loss_balance_mode == "auto":
             print(f"[Train] Loss balance: auto (GradNorm), alpha={cfg.loss_balance_alpha}")

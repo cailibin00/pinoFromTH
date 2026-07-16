@@ -45,7 +45,7 @@ def fit(obj, tf_iter=0, newton_iter=0, newton_eager=False):
                 obj.epoch_history.append(epoch+epoch_base)
                 obj.loss_all_history.append(loss_all)
                 if epoch % 500 == 0:
-                    loss_names = ['L_Reynolds', 'L_FB']
+                    loss_names = ['L_Reynolds', 'L_FB', 'L_Pgamma']
                     loss_str = ' | '.join([f'{name}={loss_all[i].numpy():.3e}' for i, name in enumerate(loss_names) if i < len(loss_all)])
                     print(f'  Epoch {epoch+epoch_base}: Total={loss_value.numpy():.3e} | {loss_str}')
                 t.set_postfix(loss=loss_value.numpy())
@@ -163,5 +163,4 @@ def train_op_inner(obj):
         return loss_value,loss_all#,temp_list
 
     return apply_grads
-
 
