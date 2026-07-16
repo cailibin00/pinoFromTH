@@ -38,11 +38,12 @@ class Config(BaseConfig):
     core = "MLP"
     use_residual = False       
     output_head_dim = 128
+    gamma_output_transform = "sigmoid"
     coslayer_mode = "mlp"
 
     # ========== 训练参数 ==========
-    layer_sizes = [2, 128, 128,256,256, 128, 128, 2]
-    total_epochs = 30000
+    layer_sizes = [2, 64 ,128, 128,256,256, 256,128, 128, 64 ,2]
+    total_epochs = 25000
     warmup_epochs = 1000
     peak_lr = 1e-3
     min_lr = 1e-6
@@ -50,10 +51,10 @@ class Config(BaseConfig):
 
     # ========== 诊断 ==========
     diag_enabled = True
-    diag_interval = 1000
+    diag_interval = 5000
 
     # ========== 输出 ==========
-    output_dir = "output_resF_silu_small_epoch30000"
+    output_dir = "output_resF_silu_small_epoch25000"
     device = "5"
 
     # ========== 绘图 ==========
@@ -77,10 +78,10 @@ class Config(BaseConfig):
 
     # ========== Reynolds 损失缩放 (缩小 PDE 残差项) ==========
     # schedule 上限: log-space 1e-8 → 1e-6 → 1e-4 → max，光滑渐进升温
-    reynolds_weight_mode = "adaptive"  # "fixed" | "adaptive"
+    reynolds_weight_mode = "fixed"  # "fixed" | "adaptive"
     reynolds_loss_weight = 1e-4        # fixed 模式: 直接缩放因子
     reynolds_weight_target = 0.01      # adaptive: loss-driven 目标贡献值
-    reynolds_weight_min = 1e-7         # adaptive: 起始权重 (epoch 0)
+    reynolds_weight_min = 1e-9         # adaptive: 起始权重 (epoch 0)
     reynolds_weight_max = 1e-3         # adaptive: 最终权重 (epoch → total)
 
     # ========== L-BFGS 精调 ==========
@@ -88,5 +89,4 @@ class Config(BaseConfig):
     fine_tune_enabled = False
     fine_tune_epochs = 1000
     fine_tune_eager = False
-
 

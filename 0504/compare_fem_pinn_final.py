@@ -121,25 +121,20 @@ def load_pinn_and_predict(model_path: str, coords: np.ndarray, cfg, params: dict
     lower_bc = dirichletBC(Domain, val=params["P_i"], var="R", target="lower")
     upper_bc = dirichletBC(Domain, val=params["P_o"], var="R", target="upper")
 
-    # 确定 u_model_switch
-    if cfg.core == "pikan":
-        u_model_switch = 13
-    else:
-        u_model_switch = 8
+    u_model_switch = 8
 
     model = CollocationSolverND()
     model.compile(
         cfg.layer_sizes, [f_model_FBNS], Domain, [lower_bc, upper_bc],
         u_model_switch=u_model_switch, two_output=True, none_zero=False,
         adapt_True=False, isAdaptive=False, MTL_adapt=False,
-        PCGrad_true=True, Boundary_true=False,
+        Boundary_true=False,
         R_range=params["R_lim"], theta_range=params["theta_lim"],
         # 与训练时一致
         Act=cfg.Act, use_residual=cfg.use_residual,
         output_head_dim=cfg.output_head_dim, batch_size=cfg.batch_size,
         coslayer_mode=cfg.coslayer_mode,
-        kan_grid_size=cfg.kan_grid_size, kan_spline_order=cfg.kan_spline_order,
-        pikan_layer_sizes=cfg.pikan_layer_sizes,
+        gamma_output_transform=getattr(cfg, "gamma_output_transform", "tanh_square"),
     )
 
     # 载入权重

@@ -38,6 +38,7 @@ class Config(BaseConfig):
     core = "MLP"
     use_residual = False
     output_head_dim = 64
+    gamma_output_transform = "tanh_square"
     coslayer_mode = "mlp"
 
     # ========== 训练参数 ==========

@@ -20,14 +20,13 @@ class CollocationSolverND:
     def compile(self, layer_sizes, f_model_list, domain, bcs, isAdaptive=False,
                 dict_adaptive=None, init_weights=None, g=None, dist=False,
                 u_model_switch=1, two_output=False, none_zero = False, adapt_True = False,
-                MTL_adapt = False, PCGrad_true = False, Boundary_true = True,
+                MTL_adapt = False, Boundary_true = True,
                 R_range = [], theta_range = [],
                 # ---- 新增可配置参数 ----
                 Act = "tanh", use_residual = False, output_head_dim = 64,
                 batch_size = None, device = "0",
                 coslayer_mode = "simple",
-                kan_grid_size = 5, kan_spline_order = 3,
-                pikan_layer_sizes = None):
+                gamma_output_transform = "tanh_square"):
         """
         Args:
             layer_sizes: A list of layer sizes, can be overwritten via resetting u_model to a keras model
@@ -46,9 +45,6 @@ class CollocationSolverND:
             batch_size: minibatch size (None = full batch)
             device: GPU device ID string (e.g. "0", "-1"=auto, "cpu")
             coslayer_mode: "simple" (original linear mix) or "mlp" (separate R/theta MLP pathways)
-            kan_grid_size: B-spline grid intervals (for core="pikan")
-            kan_spline_order: B-spline polynomial order (for core="pikan")
-            pikan_layer_sizes: layer sizes for PIKAN (for core="pikan")
 
         Returns:
             None
@@ -99,22 +95,8 @@ class CollocationSolverND:
                 self.R_range, self.theta_range,
                 activation=Act, use_residual=use_residual,
                 output_head_dim=output_head_dim,
-                coslayer_mode=coslayer_mode)
-
-        elif self.u_model_switch == 13:
-            # PIKAN (KAN-based architecture)
-            self.R_range = R_range
-            self.theta_range = theta_range
-            _pikan_layers = pikan_layer_sizes if pikan_layer_sizes is not None else layer_sizes
-            self.u_model = PIKAN_Polar_BC_Two_Output(
-                _pikan_layers,
-                [self.bcs[0].val, self.bcs[1].val],
-                self.R_range, self.theta_range,
-                kan_grid_size=kan_grid_size,
-                kan_spline_order=kan_spline_order,
-                output_head_dim=output_head_dim,
-                use_residual=use_residual,
-                coslayer_mode=coslayer_mode)
+                coslayer_mode=coslayer_mode,
+                gamma_output_transform=gamma_output_transform)
 
         elif self.u_model_switch == 9:
             self.R_range = R_range
@@ -136,7 +118,6 @@ class CollocationSolverND:
             self.theta_range = theta_range
             self.u_model = new_neural_period_polar_exactBC(self.layer_sizes,[self.bcs[0].val,self.bcs[1].val],self.R_range, self.theta_range)
 
-        self.PCGrad_true = PCGrad_true#True
         self.Boundary_true = Boundary_true
         #######################################
         self.loss_history = []
@@ -153,9 +134,6 @@ class CollocationSolverND:
         #self.adaptive_constant = tf.constant(np.array([1, 1, 1, 1]),tf.float32)  # loss权重系数
         self.adaptive_constant_alpha = tf.constant(0.2, tf.float32)
         self.adaptive_constant_func = ComputeSum_weight(len(self.update_loss_seperate()), self.adaptive_constant_alpha)
-
-        self.adaptive_constant_alpha_PCGrad_loss = tf.constant(1e-1, tf.float32)
-        self.adaptive_constant_func_PCGrad_loss = ComputeSum_weight(len(self.update_loss_seperate()), self.adaptive_constant_alpha_PCGrad_loss)
 
         self.adaptive_constant_func_list = []
         self.loss_value_min = 1.e12
@@ -585,63 +563,6 @@ class CollocationSolverND:
             adaptive_constant_new = tf.maximum(adaptive_constant_new, 1e-2)
             self.adaptive_constant_func(adaptive_constant_new)  # 更新系数
             # self.adaptive_constant_func_list.append(self.adaptive_constant_func.adaptive_constant)
-        if self.PCGrad_true:
-            #tf.random.shuffle(loss_all)
-            grad_all = [tape.gradient(loss, self.variables) for loss in loss_all]
-
-            num_tasks = len(loss_all)
-
-
-            for counter_grad_all in range(num_tasks):
-               for counter_grad, grad in enumerate(grad_all[counter_grad_all]):
-                   if grad == None:
-                       grad_all[counter_grad_all][counter_grad] = 0.*grad_total[counter_grad]
-            #grads_task = [tf.concat([tf.reshape(grad, [-1, ]) for grad in grads], axis=0) for grads in grad_all]#grad_all_flatten
-            grads_task = [tf.concat([tf.reshape(grad, [-1, ]) for grad in grads], axis=0) for grads in grad_all]
-            if self.balance:
-                self.adaptive_constant_func_PCGrad_loss(tf.convert_to_tensor(loss_all))
-                loss_all_smooth = self.adaptive_constant_func_PCGrad_loss.adaptive_constant
-                loss_all_smooth_reference = self.adaptive_constant_func_PCGrad_loss.adaptive_constant_step
-                loss_effective = [loss_all_smooth[:, k] / loss_all_smooth_reference[:, k] for k in range(num_tasks)]
-                loss_effective_01 = [loss_effective[k] / tf.reduce_sum(loss_effective) for k in range(num_tasks)]
-
-                grads_task_norm = [tf.math.sqrt(tf.reduce_sum(grads**2)) for grads in grads_task]
-
-                #weight_grads_task_norm = [tf.reduce_mean(grads_task_norm)/grads_norm for grads_norm in grads_task_norm]
-                weight_grads_task_norm = [(loss_effective_01[k]*(tf.reduce_mean(grads_task_norm)-grads_task_norm[k])+grads_task_norm[k]) / grads_task_norm[k] for k in range(num_tasks)]
-
-                grads_task_weighted =  [grads_task[k]* weight_grads_task_norm[k] for k in range(num_tasks)]
-
-                grads_task = grads_task_weighted
-
-            np.random.shuffle(grads_task)
-            grads_task_proj = []
-            for grad_task in (grads_task):
-                for k in range(num_tasks):
-                    inner_product = tf.reduce_sum(grad_task * grads_task[k])
-                    proj_direction = inner_product / tf.reduce_sum(grads_task[k] * grads_task[k]+1e-12)#防止当一个任务梯度为0时，出现NaN
-                    grad_task = grad_task - tf.minimum(proj_direction, 0.) * grads_task[k]
-                grads_task_proj.append(grad_task)
-            #self.grads_task_proj = grads_task_proj
-            proj_grads_flatten = grads_task_proj
-
-
-            #重新组合成各层的形式并求和
-            proj_grads = []
-            for j in range(num_tasks):
-                start_idx = 0
-                for idx, var in enumerate(self.variables):
-                    grad_shape = var.get_shape()
-                    flatten_dim = np.prod([grad_shape.dims[i].value for i in range(len(grad_shape.dims))])
-                    proj_grad = proj_grads_flatten[j][start_idx:start_idx + flatten_dim]
-                    proj_grad = tf.reshape(proj_grad, grad_shape)
-                    if len(proj_grads) < len(self.variables):
-                        proj_grads.append(proj_grad)
-                    else:
-                        proj_grads[idx] += proj_grad#直接求和了
-                    start_idx += flatten_dim
-            grad_total = proj_grads
-            loss_total = tf.reduce_sum(loss_all)
         return loss_total, grad_total, loss_all#loss_all# , grad_net_1,grad_net_2
 
 
@@ -809,4 +730,3 @@ class ComputeSum_weight(keras.layers.Layer):
                 self.adaptive_constant_step.assign(self.adaptive_constant)
                 self.count = 0
             #self.count.assign(self.count+self.one)
-

@@ -89,15 +89,11 @@ class Config:
 
     # ========== 模型架构参数（可配置） ==========
     Act = "tanh"            # 激活函数: "tanh" 或 "silu"
-    core = "MLP"            # 网络类型: "mlp" 或 "pikan" (KAN架构)
+    core = "MLP"            # 网络类型: MLP
     use_residual = False    # 是否使用残差连接
     output_head_dim = 64    # 输出头隐藏层维度 (用于深度输出头)
+    gamma_output_transform = "tanh_square"  # "tanh_square" | "sigmoid"
     coslayer_mode = "mlp"  # 输入编码层: "simple" (原版线性混合) 或 "mlp" (R/θ各自MLP通路)
-
-    # PIKAN 参数 (仅 core="pikan" 时生效)
-    kan_grid_size = 5       # B-spline 网格区间数
-    kan_spline_order = 3    # B-spline 多项式阶数
-    pikan_layer_sizes = [2, 64, 64, 64, 64, 2]  # PIKAN 层大小
 
     # 训练参数
     layer_sizes = [2, 128, 128, 256 ,128, 128, 2]
@@ -143,6 +139,7 @@ class Config:
     fine_tune_enabled = False     # Adam 训练结束后是否运行 L-BFGS 精调
     fine_tune_epochs = 1000       # L-BFGS 迭代步数 (推荐: 500~2000)
     fine_tune_eager = False       # True=eager模式 (有get_weights修复), False=graph模式 (推荐, 更稳健)
+    restore_best_before_analysis = True  # Use best checkpoint for final diagnostics/model/figures.
 
     # 诊断参数
     diag_enabled = True         # 是否启用训练诊断
@@ -495,7 +492,7 @@ def _create_lr_schedule(cfg):
 # 影响模型结构的配置键
 _ARCH_KEYS = [
     'layer_sizes', 'core', 'Act', 'use_residual', 'coslayer_mode',
-    'output_head_dim', 'kan_grid_size', 'kan_spline_order', 'pikan_layer_sizes',
+    'output_head_dim', 'gamma_output_transform',
 ]
 
 
@@ -912,9 +909,6 @@ def main(config_id=1, resume=False, resume_path=None):
     print(f"Activation: {cfg.Act}")
     print(f"Residual: {cfg.use_residual}")
     print(f"Layer sizes: {cfg.layer_sizes}")
-    if cfg.core == "pikan":
-        print(f"PIKAN: grid={cfg.kan_grid_size}, order={cfg.kan_spline_order}, "
-              f"layers={cfg.pikan_layer_sizes}")
     print(f"Output dir: {output_dir}")
 
     params = compute_physical_params(cfg)
@@ -945,11 +939,7 @@ def main(config_id=1, resume=False, resume_path=None):
     upper_bc = dirichletBC(Domain, val=params['P_o'], var='R', target="upper")
     BCs = [lower_bc, upper_bc]
 
-    # 确定 u_model_switch: 8=mlp-two-output, 13=pikan-two-output
-    if cfg.core == "pikan":
-        u_model_switch = 13
-    else:
-        u_model_switch = 8
+    u_model_switch = 8
 
     # 创建并编译模型
     model = CollocationSolverND()
@@ -957,13 +947,12 @@ def main(config_id=1, resume=False, resume_path=None):
         cfg.layer_sizes, [f_model_FBNS], Domain, BCs,
         u_model_switch=u_model_switch, two_output=True, none_zero=False,
         adapt_True=False, isAdaptive=False, MTL_adapt=False,
-        PCGrad_true=True, Boundary_true=False,
+        Boundary_true=False,
         R_range=params['R_lim'], theta_range=params['theta_lim'],
         Act=cfg.Act, use_residual=cfg.use_residual,
         output_head_dim=cfg.output_head_dim, batch_size=cfg.batch_size,
         coslayer_mode=cfg.coslayer_mode,
-        kan_grid_size=cfg.kan_grid_size, kan_spline_order=cfg.kan_spline_order,
-        pikan_layer_sizes=cfg.pikan_layer_sizes,
+        gamma_output_transform=cfg.gamma_output_transform,
     )
 
     # 最佳模型保存到 checkpoints/
@@ -1017,6 +1006,14 @@ def main(config_id=1, resume=False, resume_path=None):
     # 训练
     print("Starting training..." if not skip_adam else "Starting fine-tuning...")
     model = train_model(model, cfg, params=params, diag=diag, skip_adam=skip_adam)
+
+    if getattr(cfg, 'restore_best_before_analysis', True):
+        best_path = model.best_weights_path
+        if os.path.exists(best_path + ".index"):
+            model.u_model.load_weights(best_path)
+            print(f"[Best] Restored best checkpoint before diagnostics/save: {best_path}")
+        else:
+            print(f"[Best] No best checkpoint found at {best_path}; using current weights.")
 
     # ---- 训练后诊断 ----
     if cfg.diag_enabled:

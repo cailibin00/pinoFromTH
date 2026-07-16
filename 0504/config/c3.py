@@ -38,12 +38,8 @@ class Config(BaseConfig):
     core = "mlp"
     use_residual = True
     output_head_dim = 64
+    gamma_output_transform = "tanh_square"
     coslayer_mode = "mlp"
-
-    # ========== PIKAN 参数 ==========
-    kan_grid_size = 5
-    kan_spline_order = 3
-    pikan_layer_sizes = [2, 64, 64, 64, 64, 2]
 
     # ========== 训练参数 ==========
     layer_sizes = [2, 256, 256, 256, 128, 128, 2]   # ← 更宽
