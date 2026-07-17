@@ -1,47 +1,16 @@
-"""
-torch_pinn - PyTorch implementation of PINN for Reynolds equation with JFO cavitation.
-Faithful 1:1 port from tensordiffeq (TensorFlow).
-"""
+"""Control-volume augmented-Lagrangian PINN for JFO Reynolds cavitation."""
 
-from .networks import (
-    Coslayer_normalization,
-    Out_Imp_BC_layer,
-    Out_Imp_BC_value_layer,
-    new_neural_period_polar_exactBC_two_output,
-    KANLinear,
-    PIKAN_Polar_BC_Two_Output,
-    count_model_params,
-    auto_pikan_layer_sizes,
-)
+from .checkpoint import load_checkpoint
+from .config import ExperimentConfig, StageConfig
+from .geometry import FilmGeometry, PhysicalParams, compute_physical_params
+from .networks import CVALModel
 
-from .models import CollocationSolverND
-
-from .domains import DomainND
-
-from .boundaries import (
-    BC,
-    dirichletBC,
-    FunctionDirichletBC,
-    FunctionNeumannBC,
-    IC,
-    periodicBC,
-)
-
-from .utils import (
-    mse,
-    find_L2_error,
-    latin_hypercube_sample,
-    multimesh,
-    flatten_and_stack,
-    set_weights_torch,
-    get_weights_torch,
-    get_sizes,
-    Tee,
-    ensure_dir,
-    to_torch,
-    grad,
-)
-
-from .optimizers import LBFGS_Trainer
-
-from .fit import fit as fit_model
+__all__ = [
+    "CVALModel",
+    "ExperimentConfig",
+    "FilmGeometry",
+    "PhysicalParams",
+    "StageConfig",
+    "compute_physical_params",
+    "load_checkpoint",
+]
