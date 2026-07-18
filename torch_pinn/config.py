@@ -14,15 +14,18 @@ class StageConfig:
     gamma_enabled: bool
     adam_epochs: int
     lbfgs_steps: int = 0
+    active_gate_enabled: bool = True
+    active_pressure_ratio: float = 0.25
+    active_gate_tau: float = 0.05
 
 
 def default_stages() -> list[StageConfig]:
     return [
         StageConfig("full_film_010", 0.10, 4.0, 1e-2, False, 2_000),
-        StageConfig("cavitation_025", 0.25, 4.0, 1e-2, True, 3_000),
-        StageConfig("cavitation_050", 0.50, 4.0, 1e-3, True, 3_000),
-        StageConfig("cavitation_075", 0.75, 2.0, 1e-4, True, 3_000),
-        StageConfig("true_physics", 1.00, 1.0, 1e-5, True, 5_000, 200),
+        StageConfig("cavitation_025", 0.25, 4.0, 1e-2, True, 3_000, active_gate_tau=0.08),
+        StageConfig("cavitation_050", 0.50, 4.0, 1e-3, True, 3_000, active_gate_tau=0.05),
+        StageConfig("cavitation_075", 0.75, 2.0, 1e-4, True, 3_000, active_gate_tau=0.03),
+        StageConfig("true_physics", 1.00, 1.0, 1e-5, True, 5_000, 200, active_gate_tau=0.02),
     ]
 
 
@@ -62,6 +65,7 @@ class ExperimentConfig:
     # Fixed physical preconditioning scales
     pressure_ref: float = 0.1
     film_ref: float = 2.0
+    gamma_active_threshold: float = 1.0e-6
 
     # Optimisation
     seed: int = 20260718
@@ -82,7 +86,17 @@ class ExperimentConfig:
     best_global_flux_tolerance: float = 1.0e-5
     best_boundary_tolerance: float = 1.0e-10
     best_periodic_tolerance: float = 1.0e-10
+    best_min_gamma_active_fraction: float = 1.0e-3
     stages: list[StageConfig] = field(default_factory=default_stages)
+
+    # Sampling emphasis for the A-min active-set run. The base grid stays fixed;
+    # only minibatch probabilities change.
+    stratified_sampling: bool = True
+    transition_sampling_weight: float = 4.0
+    radial_boundary_sampling_weight: float = 1.5
+    periodic_seam_sampling_weight: float = 1.0
+    active_sampling_weight: float = 8.0
+    active_sampling_interval: int = 50
 
     # Outputs and automatic post-training evaluation
     output_dir: str = "output_torch_cv_al"
@@ -133,6 +147,6 @@ class ExperimentConfig:
         )
         cfg.stages = [
             StageConfig("smoke_full_film", 0.1, 4.0, 1e-2, False, 2),
-            StageConfig("smoke_true", 1.0, 1.0, 1e-3, True, 2),
+            StageConfig("smoke_true", 1.0, 1.0, 1e-3, True, 2, active_gate_tau=0.08),
         ]
         return cfg

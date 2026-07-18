@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 import math
 
 import torch
@@ -57,6 +58,15 @@ def _softplus_inverse(value: float, beta: float) -> float:
     return math.log(math.expm1(beta * value)) / beta
 
 
+@dataclass
+class OutputComponents:
+    pressure: torch.Tensor
+    gamma: torch.Tensor
+    pressure_bar: torch.Tensor
+    active_gate: torch.Tensor
+    gamma_candidate: torch.Tensor
+
+
 class CVALModel(nn.Module):
     """A-min model: independent pressure and cavitation networks."""
 
@@ -78,6 +88,7 @@ class CVALModel(nn.Module):
         self.r_min = params.r_min
         self.r_max = params.r_max
         self.beta = cfg.softplus_beta
+        self.pressure_ref = float(cfg.pressure_ref)
         self.register_buffer(
             "pressure_latent_inner",
             torch.tensor(_softplus_inverse(params.pressure_inner, self.beta)),
@@ -87,11 +98,40 @@ class CVALModel(nn.Module):
             torch.tensor(_softplus_inverse(params.pressure_outer, self.beta)),
         )
         self.gamma_enabled = True
+        self.active_gate_enabled = True
+        self.active_pressure_ratio = 0.25
+        self.active_gate_tau = 0.05
 
     def set_gamma_enabled(self, enabled: bool) -> None:
         self.gamma_enabled = enabled
 
-    def output_fields(self, coords: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def configure_active_gate(
+        self,
+        enabled: bool,
+        pressure_ratio: float,
+        tau: float,
+    ) -> None:
+        self.active_gate_enabled = bool(enabled)
+        self.active_pressure_ratio = float(pressure_ratio)
+        self.active_gate_tau = max(float(tau), 1e-8)
+
+    def active_gate_state(self) -> dict[str, bool | float]:
+        return {
+            "enabled": self.active_gate_enabled,
+            "pressure_ratio": self.active_pressure_ratio,
+            "tau": self.active_gate_tau,
+        }
+
+    def load_active_gate_state(self, state: dict[str, object] | None) -> None:
+        if not state:
+            return
+        self.configure_active_gate(
+            bool(state.get("enabled", self.active_gate_enabled)),
+            float(state.get("pressure_ratio", self.active_pressure_ratio)),
+            float(state.get("tau", self.active_gate_tau)),
+        )
+
+    def output_components(self, coords: torch.Tensor) -> OutputComponents:
         features = self.features(coords)
         t = (coords[:, 0:1] - self.r_min) / (self.r_max - self.r_min)
         distance = 4.0 * t * (1.0 - t)
@@ -101,11 +141,32 @@ class CVALModel(nn.Module):
         )
         pressure_latent = pressure_latent_bc + distance * self.pressure_net(features)
         pressure = F.softplus(pressure_latent, beta=self.beta)
+        pressure_bar = pressure / self.pressure_ref
         if self.gamma_enabled:
-            gamma = distance * torch.sigmoid(self.gamma_net(features))
+            gamma_candidate = distance * torch.sigmoid(self.gamma_net(features))
+            if self.active_gate_enabled:
+                active_gate = torch.sigmoid(
+                    (self.active_pressure_ratio - pressure_bar)
+                    / self.active_gate_tau
+                )
+            else:
+                active_gate = torch.ones_like(pressure)
+            gamma = gamma_candidate * active_gate
         else:
+            gamma_candidate = torch.zeros_like(pressure)
+            active_gate = torch.zeros_like(pressure)
             gamma = torch.zeros_like(pressure)
-        return pressure, gamma
+        return OutputComponents(
+            pressure=pressure,
+            gamma=gamma,
+            pressure_bar=pressure_bar,
+            active_gate=active_gate,
+            gamma_candidate=gamma_candidate,
+        )
+
+    def output_fields(self, coords: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        components = self.output_components(coords)
+        return components.pressure, components.gamma
 
     def forward(self, coords: torch.Tensor) -> torch.Tensor:
         pressure, gamma = self.output_fields(coords)

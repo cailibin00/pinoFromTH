@@ -59,10 +59,25 @@ class ControlVolumeGrid:
     def all_indices(self) -> np.ndarray:
         return np.arange(len(self), dtype=np.int64)
 
-    def sample_indices(self, size: int, rng: np.random.Generator) -> np.ndarray:
+    def sample_indices(
+        self,
+        size: int,
+        rng: np.random.Generator,
+        weights: np.ndarray | None = None,
+    ) -> np.ndarray:
         if size >= len(self):
             return self.all_indices()
-        return rng.choice(len(self), size=size, replace=False)
+        probabilities = None
+        if weights is not None:
+            values = np.asarray(weights, dtype=np.float64)
+            if values.shape != (len(self),):
+                raise ValueError("Sampling weights must match the grid size")
+            total = float(values.sum())
+            if total > 0.0 and np.all(np.isfinite(values)):
+                probabilities = values / total
+        return rng.choice(
+            len(self), size=size, replace=False, p=probabilities
+        )
 
     def center_tensor(
         self,

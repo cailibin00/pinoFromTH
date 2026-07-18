@@ -32,6 +32,7 @@ def save_checkpoint(
         "epoch": epoch,
         "metrics": metrics,
         "gamma_enabled": model.gamma_enabled,
+        "active_gate": model.active_gate_state(),
     }
     if optimizer is not None:
         payload["optimizer_state"] = optimizer.state_dict()
@@ -57,5 +58,7 @@ def load_checkpoint(
     model = CVALModel(config, params).to(device=target, dtype=dtype)
     model.load_state_dict(payload["model_state"])
     model.set_gamma_enabled(bool(payload.get("gamma_enabled", True)))
+    active_gate = payload.get("active_gate")
+    model.load_active_gate_state(active_gate if isinstance(active_gate, dict) else None)
     model.eval()
     return model, config, payload

@@ -51,6 +51,29 @@ class TorchCVALTests(unittest.TestCase):
         end = torch.cat([radius, torch.full_like(radius, self.params.theta_max)], dim=1)
         self.assertLess(float((model(start) - model(end)).abs().max()), 1e-12)
 
+    def test_active_gate_suppresses_gamma_away_from_low_pressure(self) -> None:
+        model = CVALModel(self.cfg, self.params)
+        model.configure_active_gate(True, pressure_ratio=0.25, tau=0.05)
+        coords = torch.tensor(
+            [[0.5 * (self.params.r_min + self.params.r_max), 0.3]],
+            dtype=torch.float64,
+        )
+        components = model.output_components(coords)
+        self.assertGreater(float(components.gamma_candidate.max()), 0.1)
+        self.assertLess(float(components.active_gate.max()), 1e-3)
+        self.assertLess(float(components.gamma.max()), 1e-3)
+
+    def test_active_gate_can_open_gamma_channel(self) -> None:
+        model = CVALModel(self.cfg, self.params)
+        model.configure_active_gate(True, pressure_ratio=2.0, tau=0.05)
+        coords = torch.tensor(
+            [[0.5 * (self.params.r_min + self.params.r_max), 0.3]],
+            dtype=torch.float64,
+        )
+        components = model.output_components(coords)
+        self.assertGreater(float(components.active_gate.min()), 0.99)
+        self.assertGreater(float(components.gamma.min()), 0.1)
+
     def test_direct_flux_signs_and_factors(self) -> None:
         coords = torch.tensor([[0.95, 0.13], [0.98, 0.31]])
         values = evaluate_flux(

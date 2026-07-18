@@ -1,0 +1,28 @@
+FEM vs Torch CV-AL PINN metrics
+================================================================
+P_rel_L2                                         = 1.19657028e+00
+P_rel_Linf                                       = 9.78247194e-01
+G_rel_L2                                         = 9.99999993e-01
+G_rel_Linf                                       = 9.99999999e-01
+P_MAE                                            = 4.62841564e-02
+P_RMSE                                           = 5.88466140e-02
+G_MAE                                            = 1.58142903e-01
+G_RMSE                                           = 3.25334551e-01
+complementarity_violation_max                    = 3.97753154e-09
+complementarity_violation_mean                   = 1.22218747e-10
+P_rel_L2_cavRegion                               = 5.81238058e+16
+G_rel_L2_cavRegion                               = 9.99999993e-01
+P_rel_L2_fullRegion                              = 1.00174600e+00
+G_abs_RMSE_fullRegion                            = 4.90450556e-09
+cavitation_IoU_1e-06                             = 0.00000000e+00
+cavitation_Dice_1e-06                            = 0.00000000e+00
+cavitation_IoU_1e-05                             = 0.00000000e+00
+cavitation_Dice_1e-05                            = 0.00000000e+00
+cavitation_IoU_1e-04                             = 0.00000000e+00
+cavitation_Dice_1e-04                            = 0.00000000e+00
+cavitation_IoU_1e-03                             = 0.00000000e+00
+cavitation_Dice_1e-03                            = 0.00000000e+00
+cavitation_IoU_1e-02                             = 0.00000000e+00
+cavitation_Dice_1e-02                            = 0.00000000e+00
+cavitation_IoU                                   = 0.00000000e+00
+cavitation_Dice                                  = 0.00000000e+00

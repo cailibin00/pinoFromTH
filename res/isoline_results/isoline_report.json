@@ -1,0 +1,41 @@
+{
+  "isoline_level": 1e-06,
+  "thresholds": [
+    {
+      "threshold": 1e-06,
+      "iou": 0.0,
+      "dice": 0.0,
+      "fem_fraction": 0.25346235408983775,
+      "pinn_fraction": 0.0
+    },
+    {
+      "threshold": 1e-05,
+      "iou": 0.0,
+      "dice": 0.0,
+      "fem_fraction": 0.25346235408983775,
+      "pinn_fraction": 0.0
+    },
+    {
+      "threshold": 0.0001,
+      "iou": 0.0,
+      "dice": 0.0,
+      "fem_fraction": 0.25344369748944345,
+      "pinn_fraction": 0.0
+    },
+    {
+      "threshold": 0.001,
+      "iou": 0.0,
+      "dice": 0.0,
+      "fem_fraction": 0.2532882258194912,
+      "pinn_fraction": 0.0
+    },
+    {
+      "threshold": 0.01,
+      "iou": 0.0,
+      "dice": 0.0,
+      "fem_fraction": 0.25199470152548803,
+      "pinn_fraction": 0.0
+    }
+  ],
+  "matched_radius_count": 0
+}

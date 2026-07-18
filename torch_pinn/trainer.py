@@ -101,6 +101,9 @@ class Trainer:
         self.best_score: tuple[float, ...] | None = None
         self.best_metrics: dict[str, float] = {}
         self.best_path = self.artifacts.checkpoints / "best.pt"
+        self.static_sampling_weights = self._build_static_sampling_weights()
+        self.active_sampling_weights: np.ndarray | None = None
+        self.active_sampling_epoch = -1
 
     def _stage_lambda(self, stage: StageConfig) -> float:
         return self.params.lambda_value * stage.lambda_ratio
@@ -112,6 +115,84 @@ class Trainer:
         progress = (epoch - warmup) / max(1, total_epochs - warmup)
         cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
         return self.cfg.min_lr + (self.cfg.peak_lr - self.cfg.min_lr) * cosine
+
+    def _configure_stage_model(self, stage: StageConfig) -> None:
+        self.model.set_gamma_enabled(stage.gamma_enabled)
+        self.model.configure_active_gate(
+            stage.gamma_enabled and stage.active_gate_enabled,
+            stage.active_pressure_ratio,
+            stage.active_gate_tau,
+        )
+
+    def _build_static_sampling_weights(self) -> np.ndarray:
+        if not self.cfg.stratified_sampling:
+            return np.ones(len(self.train_grid), dtype=np.float64)
+        centers = torch.as_tensor(self.train_grid.centers, dtype=self.dtype)
+        with torch.no_grad():
+            film = self.geometry.film_thickness(centers, xi_ratio=1.0).cpu().numpy()
+        h_min = float(film.min())
+        h_max = float(film.max())
+        h_norm = (film.reshape(-1) - h_min) / max(h_max - h_min, 1e-12)
+        transition = 4.0 * h_norm * (1.0 - h_norm)
+
+        radius = self.train_grid.centers[:, 0]
+        theta = self.train_grid.centers[:, 1]
+        radial_t = (radius - self.params.r_min) / (self.params.r_max - self.params.r_min)
+        theta_t = (theta - self.params.theta_min) / (
+            self.params.theta_max - self.params.theta_min
+        )
+        radial_edge = np.exp(-np.minimum(radial_t, 1.0 - radial_t) / 0.08)
+        seam_edge = np.exp(-np.minimum(theta_t, 1.0 - theta_t) / 0.08)
+
+        weights = (
+            1.0
+            + self.cfg.transition_sampling_weight * transition
+            + self.cfg.radial_boundary_sampling_weight * radial_edge
+            + self.cfg.periodic_seam_sampling_weight * seam_edge
+        )
+        return np.maximum(weights.astype(np.float64), 1.0e-12)
+
+    @torch.no_grad()
+    def _refresh_active_sampling_weights(self, stage: StageConfig) -> np.ndarray:
+        if (
+            not self.cfg.stratified_sampling
+            or not stage.gamma_enabled
+            or self.cfg.active_sampling_weight <= 0.0
+        ):
+            return self.static_sampling_weights
+        interval = max(1, self.cfg.active_sampling_interval)
+        if (
+            self.active_sampling_weights is not None
+            and self.global_epoch - self.active_sampling_epoch < interval
+        ):
+            return self.active_sampling_weights
+        parts: list[np.ndarray] = []
+        all_indices = self.train_grid.all_indices()
+        for start in range(0, len(all_indices), self.cfg.cell_batch_size):
+            index = all_indices[start : start + self.cfg.cell_batch_size]
+            centers = self.train_grid.center_tensor(
+                index, self.device, self.dtype
+            )
+            components = self.model.output_components(centers)
+            active = torch.maximum(
+                components.active_gate,
+                (components.gamma > self.cfg.gamma_active_threshold).to(self.dtype),
+            )
+            parts.append(active.reshape(-1).detach().cpu().numpy())
+        active_values = np.concatenate(parts)
+        self.active_sampling_weights = self.static_sampling_weights * (
+            1.0 + self.cfg.active_sampling_weight * active_values
+        )
+        self.active_sampling_epoch = self.global_epoch
+        return self.active_sampling_weights
+
+    def _sample_train_indices(self, stage: StageConfig) -> np.ndarray:
+        weights = self._refresh_active_sampling_weights(stage)
+        return self.train_grid.sample_indices(
+            self.cfg.cell_batch_size,
+            self.rng,
+            weights=weights,
+        )
 
     def _objective(
         self,
@@ -133,7 +214,9 @@ class Trainer:
         )
         loss_cv = torch.mean(residual.normalized.square())
         centers = batch.centers
-        pressure, gamma = self.model.output_fields(centers)
+        center_components = self.model.output_components(centers)
+        pressure = center_components.pressure
+        gamma = center_components.gamma
         fb = fischer_burmeister(
             pressure, gamma, self.cfg.pressure_ref, stage.epsilon_fb
         )
@@ -153,6 +236,8 @@ class Trainer:
             "loss_fb": loss_fb,
             "pressure": pressure,
             "gamma": gamma,
+            "active_gate": center_components.active_gate,
+            "gamma_candidate": center_components.gamma_candidate,
             "fb": fb,
             "cv_residual": residual.normalized,
         }
@@ -196,6 +281,9 @@ class Trainer:
         raw_parts: list[torch.Tensor] = []
         pressure_parts: list[torch.Tensor] = []
         gamma_parts: list[torch.Tensor] = []
+        active_gate_parts: list[torch.Tensor] = []
+        gamma_candidate_parts: list[torch.Tensor] = []
+        pressure_bar_parts: list[torch.Tensor] = []
         film_parts: list[torch.Tensor] = []
         qr_parts: list[torch.Tensor] = []
         qt_parts: list[torch.Tensor] = []
@@ -229,10 +317,14 @@ class Trainer:
                 self.cfg.pressure_ref,
                 stage.epsilon_fb,
             )
+            center_components = self.model.output_components(batch.centers)
             normalized_parts.append(residual.normalized.detach())
             raw_parts.append(residual.raw_flux.detach())
             pressure_parts.append(flux.pressure.detach())
             gamma_parts.append(flux.gamma.detach())
+            active_gate_parts.append(center_components.active_gate.detach())
+            gamma_candidate_parts.append(center_components.gamma_candidate.detach())
+            pressure_bar_parts.append(center_components.pressure_bar.detach())
             film_parts.append(flux.film.detach())
             qr_parts.append(flux.q_radius.detach())
             qt_parts.append(flux.q_theta.detach())
@@ -247,6 +339,9 @@ class Trainer:
         raw = torch.cat(raw_parts)
         pressure = torch.cat(pressure_parts)
         gamma = torch.cat(gamma_parts)
+        active_gate = torch.cat(active_gate_parts)
+        gamma_candidate = torch.cat(gamma_candidate_parts)
+        pressure_bar = torch.cat(pressure_bar_parts)
         film = torch.cat(film_parts)
         q_radius = torch.cat(qr_parts)
         q_theta = torch.cat(qt_parts)
@@ -265,12 +360,25 @@ class Trainer:
             "pressure_max": float(pressure.max().cpu()),
             "gamma_min": float(gamma.min().cpu()),
             "gamma_max": float(gamma.max().cpu()),
+            "gamma_active_fraction": float(
+                (gamma > self.cfg.gamma_active_threshold).to(self.dtype).mean().cpu()
+            ),
+            "gamma_candidate_max": float(gamma_candidate.max().cpu()),
+            "active_gate_mean": float(active_gate.mean().cpu()),
+            "active_gate_p99": float(torch.quantile(active_gate, 0.99).cpu()),
+            "active_gate_max": float(active_gate.max().cpu()),
+            "low_pressure_fraction": float(
+                (pressure_bar < stage.active_pressure_ratio).to(self.dtype).mean().cpu()
+            ),
             "boundary_max_error": boundary_error,
             "periodic_max_error": periodic_error,
         }
         fields = {
             "pressure": pressure,
             "gamma": gamma,
+            "active_gate": active_gate,
+            "gamma_candidate": gamma_candidate,
+            "pressure_bar": pressure_bar,
             "film": film,
             "q_radius": q_radius,
             "q_theta": q_theta,
@@ -337,8 +445,14 @@ class Trainer:
             metrics["periodic_max_error"] / self.cfg.best_periodic_tolerance,
         )
         feasibility_rank = 0.0 if feasibility <= 1.0 else feasibility
+        active_shortfall = max(
+            0.0,
+            self.cfg.best_min_gamma_active_fraction
+            - metrics["gamma_active_fraction"],
+        ) / max(self.cfg.best_min_gamma_active_fraction, 1e-12)
         score = (
             feasibility_rank,
+            active_shortfall,
             metrics["cv_p99"],
             metrics["fb_p99"],
             metrics["max_p_times_gamma"],
@@ -395,13 +509,16 @@ class Trainer:
         print(
             f"[validation] stage={stage.name} epoch={stage_epoch} "
             f"cv_p99={metrics['cv_p99']:.4e} fb_p99={metrics['fb_p99']:.4e} "
+            f"gamma_frac={metrics['gamma_active_fraction']:.3e} "
             f"global={metrics['global_flux_balance']:.4e} best={is_best}"
         )
         self.model.train()
         return metrics
 
     def _run_adam_stage(self, stage_index: int, stage: StageConfig) -> None:
-        self.model.set_gamma_enabled(stage.gamma_enabled)
+        self._configure_stage_model(stage)
+        self.active_sampling_weights = None
+        self.active_sampling_epoch = -1
         if self.cfg.reset_al_each_stage:
             self.al.reset(self.cfg.al_mu_initial)
         optimizer = torch.optim.Adam(
@@ -420,9 +537,7 @@ class Trainer:
             learning_rate = self._lr(epoch, stage.adam_epochs)
             for group in optimizer.param_groups:
                 group["lr"] = learning_rate
-            indices = self.train_grid.sample_indices(
-                self.cfg.cell_batch_size, self.rng
-            )
+            indices = self._sample_train_indices(stage)
             optimizer.zero_grad(set_to_none=True)
             total, components = self._objective(stage, indices, create_graph=True)
             if not torch.isfinite(total):
@@ -441,6 +556,13 @@ class Trainer:
                     components["loss_constraint"].detach().cpu()
                 ),
                 "loss_fb": float(components["loss_fb"].detach().cpu()),
+                "train_gamma_max": float(components["gamma"].max().detach().cpu()),
+                "train_active_gate_mean": float(
+                    components["active_gate"].mean().detach().cpu()
+                ),
+                "train_gamma_candidate_max": float(
+                    components["gamma_candidate"].max().detach().cpu()
+                ),
                 "gradient_norm": float(torch.as_tensor(grad_norm).cpu()),
                 "learning_rate": learning_rate,
             }
