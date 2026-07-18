@@ -105,6 +105,95 @@ class HardGrooveGeometry:
             torch.full_like(coords[:, 0:1], self.cfg.thin_film),
         )
 
+    def sample_uniform(
+        self,
+        count: int,
+        device: torch.device,
+        dtype: torch.dtype,
+        generator: torch.Generator | None = None,
+    ) -> torch.Tensor:
+        radius = self.params.r_min + (
+            self.params.r_max - self.params.r_min
+        ) * torch.rand((count, 1), device=device, dtype=dtype, generator=generator)
+        theta = self.params.theta_min + self.period * torch.rand(
+            (count, 1), device=device, dtype=dtype, generator=generator
+        )
+        return torch.cat([radius, theta], dim=1)
+
+    def sample_region(
+        self,
+        region: Region,
+        count: int,
+        device: torch.device,
+        dtype: torch.dtype,
+        generator: torch.Generator | None = None,
+    ) -> torch.Tensor:
+        if count <= 0:
+            return torch.empty((0, 2), device=device, dtype=dtype)
+
+        chunks: list[torch.Tensor] = []
+        accepted = 0
+        attempts = 0
+        draw_count = max(256, count * 3)
+        want_groove = region is Region.GROOVE
+        while accepted < count and attempts < 128:
+            candidates = self.sample_uniform(draw_count, device, dtype, generator)
+            mask = self.groove_mask(candidates).squeeze(1)
+            selected = candidates[mask if want_groove else ~mask]
+            if selected.numel() > 0:
+                chunks.append(selected)
+                accepted += selected.shape[0]
+            attempts += 1
+            remaining = count - accepted
+            draw_count = max(256, remaining * 3)
+
+        if accepted < count:
+            raise RuntimeError(
+                f"Could not sample {count} points for region={region.value}; "
+                f"only accepted {accepted}."
+            )
+        return torch.cat(chunks, dim=0)[:count]
+
+    def radial_boundary_points(
+        self,
+        radius_value: float,
+        count: int,
+        device: torch.device,
+        dtype: torch.dtype,
+        generator: torch.Generator | None = None,
+    ) -> torch.Tensor:
+        radius = torch.full((count, 1), radius_value, device=device, dtype=dtype)
+        theta = self.params.theta_min + self.period * torch.rand(
+            (count, 1), device=device, dtype=dtype, generator=generator
+        )
+        return torch.cat([radius, theta], dim=1)
+
+    def periodic_pairs(
+        self,
+        count: int,
+        device: torch.device,
+        dtype: torch.dtype,
+        generator: torch.Generator | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        radius = self.params.r_min + (
+            self.params.r_max - self.params.r_min
+        ) * torch.rand((count, 1), device=device, dtype=dtype, generator=generator)
+        left = torch.cat(
+            [
+                radius,
+                torch.full((count, 1), self.params.theta_min, device=device, dtype=dtype),
+            ],
+            dim=1,
+        )
+        right = torch.cat(
+            [
+                radius,
+                torch.full((count, 1), self.params.theta_max, device=device, dtype=dtype),
+            ],
+            dim=1,
+        )
+        return left, right
+
     def interface_points(
         self,
         count: int,

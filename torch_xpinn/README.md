@@ -28,12 +28,26 @@ Current status:
 
 - `geometry.py`: hard spiral-groove mask and interface sampling.
 - `networks.py`: two independent pressure/gamma experts.
-- `physics.py`: constant-H regional fluxes and interface losses.
+- `physics.py`: constant-H regional PDE residuals, FB losses, fluxes, and interface losses.
 - `logging.py`: traditional per-term loss output with raw values, weights, and contributions.
-- `../reynold_xpinn.py`: scaffold inspection entry.
+- `trainer.py`: Adam training loop, checkpoints, logs, and sampled region batches.
+- `evaluation.py`: FEM loading, hard-mask XPINN prediction, metrics, and comparison figures.
+- `../reynold_xpinn.py`: active training entry.
+- `../compare_fem_xpinn.py`: standalone checkpoint evaluation entry.
 
-Next implementation step:
+Quick checks:
 
-```text
-Add region interior physics losses and a staged trainer.
+```powershell
+python reynold_xpinn.py --inspect-geometry --device cpu --smoke
+python reynold_xpinn.py --device cpu --smoke --output-dir output_xpinn_smoke --no-evaluate
+python compare_fem_xpinn.py --checkpoint output_xpinn_smoke/checkpoints/best.pt --device cpu
 ```
+
+Normal training starts with:
+
+```powershell
+python reynold_xpinn.py --device cuda
+```
+
+By default, training evaluates the best checkpoint against `p_FBNS.txt` and `g_FBNS.txt`.
+The training log prints each raw loss, weight, and weighted contribution.
