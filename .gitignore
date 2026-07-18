@@ -2,6 +2,7 @@ result*/
 checkpoint
 output/
 output_*/
+res*/
 .claude/
 # 1. Python 缓存和编译文件 (必须屏蔽，否则每次运行都会提示文件被修改)
 __pycache__/
