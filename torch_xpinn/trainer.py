@@ -10,12 +10,12 @@ from .config import XPINNConfig
 from .geometry import HardGrooveGeometry, Region, compute_physical_params
 from .logging import format_loss_block, scalar, weighted_total
 from .networks import XPINNModel
-from .physics import (
-    evaluate_region_flux,
-    interface_losses,
-    region_fb_loss,
-    region_pde_loss,
-)
+from .physics import region_jfo_loss, region_reynolds_loss
+
+try:
+    from tqdm.auto import tqdm
+except ImportError:  # pragma: no cover - optional display dependency
+    tqdm = None
 
 
 def resolve_dtype(value: str) -> torch.dtype:
@@ -48,12 +48,10 @@ class XPINNTrainer:
         self.optimizer = torch.optim.Adam(
             self.model.parameters(), lr=cfg.learning_rate
         )
-        self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             self.optimizer,
-            mode="min",
-            factor=cfg.scheduler_gamma,
-            patience=cfg.scheduler_patience,
-            min_lr=cfg.min_learning_rate,
+            T_max=max(1, cfg.epochs),
+            eta_min=cfg.min_learning_rate,
         )
         self.generator = self._make_generator()
         self.output_dir = cfg.resolve_path(project_root, cfg.output_dir)
@@ -67,16 +65,9 @@ class XPINNTrainer:
 
     def weights(self) -> dict[str, float]:
         return {
-            "thin_pde": self.cfg.thin_pde_weight,
-            "groove_pde": self.cfg.groove_pde_weight,
-            "interface_pressure": self.cfg.interface_pressure_weight,
-            "interface_flux": self.cfg.interface_flux_weight,
-            "thin_fb": self.cfg.thin_fb_weight,
-            "groove_fb": self.cfg.groove_fb_weight,
-            "inner_boundary": self.cfg.boundary_weight,
-            "outer_boundary": self.cfg.boundary_weight,
-            "periodic_value": self.cfg.periodic_weight,
-            "periodic_flux": self.cfg.periodic_weight,
+            "reynolds": self.cfg.reynolds_weight,
+            "jfo": self.cfg.jfo_weight,
+            "boundary": self.cfg.boundary_weight,
         }
 
     def _region_points(self, region: Region, count: int) -> torch.Tensor:
@@ -98,75 +89,37 @@ class XPINNTrainer:
             losses.append(torch.mean((pressure - target).square()))
         return torch.stack(losses).mean()
 
-    def _periodic_losses(self) -> dict[str, torch.Tensor]:
-        left, right = self.geometry.periodic_pairs(
-            self.cfg.periodic_points,
-            self.device,
-            self.dtype,
-            self.generator,
-        )
-        value_terms = []
-        flux_terms = []
-        for region in (Region.THIN, Region.GROOVE):
-            pressure_left, gamma_left = self.model.forward_region(left, region)
-            pressure_right, gamma_right = self.model.forward_region(right, region)
-            value_terms.append(
-                torch.mean((pressure_left - pressure_right).square())
-                + torch.mean((gamma_left - gamma_right).square())
-            )
-
-            flux_left = evaluate_region_flux(
-                self.model, self.geometry, left, region, create_graph=True
-            )
-            flux_right = evaluate_region_flux(
-                self.model, self.geometry, right, region, create_graph=True
-            )
-            flux_terms.append(
-                torch.mean((flux_left.q_radius - flux_right.q_radius).square())
-                + torch.mean((flux_left.q_theta - flux_right.q_theta).square())
-            )
-        return {
-            "periodic_value": torch.stack(value_terms).mean(),
-            "periodic_flux": torch.stack(flux_terms).mean(),
-        }
-
     def losses(self) -> dict[str, torch.Tensor]:
         thin_points = self._region_points(Region.THIN, self.cfg.thin_points)
         groove_points = self._region_points(Region.GROOVE, self.cfg.groove_points)
-        interface_points_, normals = self.geometry.interface_points(
-            self.cfg.interface_points, self.device, self.dtype
-        )
-        losses: dict[str, torch.Tensor] = {
-            "thin_pde": region_pde_loss(
-                self.model, self.geometry, thin_points, Region.THIN
-            ),
-            "groove_pde": region_pde_loss(
-                self.model, self.geometry, groove_points, Region.GROOVE
-            ),
-            "thin_fb": region_fb_loss(
-                self.model, self.geometry, thin_points, Region.THIN
-            ),
-            "groove_fb": region_fb_loss(
-                self.model, self.geometry, groove_points, Region.GROOVE
-            ),
-            "inner_boundary": self._boundary_loss(
-                self.params.r_min, self.params.pressure_inner
-            ),
-            "outer_boundary": self._boundary_loss(
-                self.params.r_max, self.params.pressure_outer
-            ),
-        }
-        losses.update(
-            interface_losses(
-                self.model,
-                self.geometry,
-                interface_points_,
-                normals,
-                create_graph=True,
-            )
-        )
-        losses.update(self._periodic_losses())
-        return losses
+
+        reynolds = torch.stack(
+            [
+                region_reynolds_loss(
+                    self.model, self.geometry, thin_points, Region.THIN
+                ),
+                region_reynolds_loss(
+                    self.model, self.geometry, groove_points, Region.GROOVE
+                ),
+            ]
+        ).mean()
+        jfo = torch.stack(
+            [
+                region_jfo_loss(self.model, thin_points, Region.THIN),
+                region_jfo_loss(self.model, groove_points, Region.GROOVE),
+            ]
+        ).mean()
+        boundary = torch.stack(
+            [
+                self._boundary_loss(
+                    self.params.r_min, self.params.pressure_inner
+                ),
+                self._boundary_loss(
+                    self.params.r_max, self.params.pressure_outer
+                ),
+            ]
+        ).mean()
+        return {"reynolds": reynolds, "jfo": jfo, "boundary": boundary}
 
     def save_checkpoint(self, name: str, epoch: int, metric: float) -> Path:
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -205,6 +158,7 @@ class XPINNTrainer:
         best = float("inf")
         best_epoch = 0
         history: list[dict[str, float]] = []
+        use_tqdm = self.cfg.use_tqdm and tqdm is not None
 
         print("Hard-partition XPINN training")
         print(f"device={self.device}, dtype={self.dtype}")
@@ -219,7 +173,14 @@ class XPINNTrainer:
             f"R=[{self.params.groove_r_min:.10f}, {self.params.groove_r_max:.10f}]"
         )
 
-        for epoch in range(1, self.cfg.epochs + 1):
+        epoch_range = range(1, self.cfg.epochs + 1)
+        progress = (
+            tqdm(epoch_range, desc="XPINN adam", dynamic_ncols=True)
+            if use_tqdm
+            else epoch_range
+        )
+
+        for epoch in progress:
             self.model.train()
             self.optimizer.zero_grad(set_to_none=True)
             losses = self.losses()
@@ -232,11 +193,19 @@ class XPINNTrainer:
             self.optimizer.step()
 
             total_value = scalar(total)
-            self.scheduler.step(total_value)
+            self.scheduler.step()
             if total_value < best:
                 best = total_value
                 best_epoch = epoch
                 self.save_checkpoint("best.pt", epoch, best)
+
+            if use_tqdm:
+                progress.set_postfix(
+                    total=f"{total_value:.3e}",
+                    reynolds=f"{scalar(losses['reynolds']):.2e}",
+                    jfo=f"{scalar(losses['jfo']):.2e}",
+                    bc=f"{scalar(losses['boundary']):.2e}",
+                )
 
             should_log = epoch == 1 or epoch % self.cfg.log_interval == 0
             if should_log:
@@ -248,7 +217,10 @@ class XPINNTrainer:
                     weights=weights,
                     learning_rate=lr,
                 )
-                print(block)
+                if use_tqdm:
+                    progress.write(block)
+                else:
+                    print(block)
                 self._write_log(block)
                 history.append(
                     {

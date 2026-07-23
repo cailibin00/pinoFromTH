@@ -1,37 +1,49 @@
-# Torch XPINN Hard-Groove Version
+# Torch XPINN Hard-Partition Version
 
-This is the new active implementation direction.
+This is the active PyTorch implementation for the spiral-groove Reynolds
+cavitation problem.
 
-Core decision:
+Core decisions:
 
 ```text
+Two experts, one for each film-thickness region.
 No sigmoid film-thickness transition.
-No global single network across H=1 and H=4.
 No explicit H derivative.
+No interface, periodic, or Fischer-Burmeister loss in training.
 ```
 
-The model uses two experts:
+The model uses two independent experts:
 
 ```text
 Thin expert   -> H = 1 region
 Groove expert -> H = 4 region
 ```
 
-The groove interface is trained only through interface conditions:
+The hard groove mask only chooses which expert evaluates a point. Inside each
+region the film thickness is constant, so the Reynolds residual does not contain
+a differentiated transition layer.
+
+Training loss is intentionally reduced to three terms:
 
 ```text
-p_thin = p_groove
-q_n_thin = q_n_groove
+L = w_R * L_Reynolds + w_JFO * L_JFO + w_BC * L_BC
 ```
 
-Current status:
+- `L_Reynolds`: raw constant-H Reynolds residual, without residual scaling or
+  stabilization variants.
+- `L_JFO`: direct complementarity loss `mean((p * gamma)^2)`.
+- `L_BC`: inner and outer radial pressure boundary loss.
 
-- `geometry.py`: hard spiral-groove mask and interface sampling.
+Optimisation is Adam with cosine annealing only.
+
+Current modules:
+
+- `geometry.py`: hard spiral-groove mask and fixed `H=1/H=4` film values.
 - `networks.py`: two independent pressure/gamma experts.
-- `physics.py`: constant-H regional PDE residuals, FB losses, fluxes, and interface losses.
-- `logging.py`: traditional per-term loss output with raw values, weights, and contributions.
-- `trainer.py`: Adam training loop, checkpoints, logs, and sampled region batches.
-- `evaluation.py`: FEM loading, hard-mask XPINN prediction, metrics, and comparison figures.
+- `physics.py`: raw Reynolds residual and direct JFO complementarity loss.
+- `logging.py`: per-term logging for the three simplified loss terms.
+- `trainer.py`: Adam training loop with cosine annealing.
+- `evaluation.py`: FEM loading, hard-mask XPINN prediction, metrics, and figures.
 - `../reynold_xpinn.py`: active training entry.
 - `../compare_fem_xpinn.py`: standalone checkpoint evaluation entry.
 
@@ -49,5 +61,5 @@ Normal training starts with:
 python reynold_xpinn.py --device cuda
 ```
 
-By default, training evaluates the best checkpoint against `p_FBNS.txt` and `g_FBNS.txt`.
-The training log prints each raw loss, weight, and weighted contribution.
+By default, training evaluates the best checkpoint against `p_FBNS.txt` and
+`g_FBNS.txt`.

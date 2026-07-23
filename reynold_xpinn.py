@@ -10,10 +10,10 @@ os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 import torch
 
 from torch_xpinn.config import XPINNConfig
-from torch_xpinn.geometry import HardGrooveGeometry, compute_physical_params
+from torch_xpinn.geometry import HardGrooveGeometry, Region, compute_physical_params
 from torch_xpinn.logging import format_loss_block
 from torch_xpinn.networks import XPINNModel
-from torch_xpinn.physics import interface_losses
+from torch_xpinn.physics import region_jfo_loss, region_reynolds_loss
 from torch_xpinn.evaluation import load_checkpoint, run_final_evaluation
 from torch_xpinn.trainer import XPINNTrainer, resolve_device, resolve_dtype
 
@@ -33,6 +33,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--inspect-geometry", action="store_true")
     parser.add_argument("--eval-only", action="store_true")
     parser.add_argument("--no-evaluate", action="store_true")
+    parser.add_argument("--no-tqdm", action="store_true")
     return parser.parse_args()
 
 
@@ -49,6 +50,8 @@ def build_config(args: argparse.Namespace) -> XPINNConfig:
         cfg.output_dir = args.output_dir
     if args.no_evaluate:
         cfg.evaluate_after_training = False
+    if args.no_tqdm:
+        cfg.use_tqdm = False
     if args.log_interval is not None:
         cfg.log_interval = args.log_interval
     if args.smoke:
@@ -58,9 +61,7 @@ def build_config(args: argparse.Namespace) -> XPINNConfig:
         cfg.fourier_modes = 4
         cfg.thin_points = 64
         cfg.groove_points = 64
-        cfg.interface_points = 64
         cfg.boundary_points = 32
-        cfg.periodic_points = 32
         cfg.log_interval = 1
         cfg.checkpoint_interval = 0
     return cfg
@@ -88,13 +89,29 @@ def inspect_geometry(cfg: XPINNConfig) -> None:
     geometry = HardGrooveGeometry(cfg)
     params = compute_physical_params(cfg)
     model = XPINNModel(cfg, params).to(device=device, dtype=dtype)
-    points, normals = geometry.interface_points(
-        cfg.interface_points, device=device, dtype=dtype
+    thin_points = geometry.sample_region(
+        Region.THIN, cfg.thin_points, device, dtype
     )
-    losses = interface_losses(model, geometry, points, normals, create_graph=True)
+    groove_points = geometry.sample_region(
+        Region.GROOVE, cfg.groove_points, device, dtype
+    )
+    losses = {
+        "reynolds": torch.stack(
+            [
+                region_reynolds_loss(model, geometry, thin_points, Region.THIN),
+                region_reynolds_loss(model, geometry, groove_points, Region.GROOVE),
+            ]
+        ).mean(),
+        "jfo": torch.stack(
+            [
+                region_jfo_loss(model, thin_points, Region.THIN),
+                region_jfo_loss(model, groove_points, Region.GROOVE),
+            ]
+        ).mean(),
+    }
     weights = {
-        "interface_pressure": cfg.interface_pressure_weight,
-        "interface_flux": cfg.interface_flux_weight,
+        "reynolds": cfg.reynolds_weight,
+        "jfo": cfg.jfo_weight,
     }
 
     print("Hard-partition XPINN scaffold")
@@ -102,7 +119,8 @@ def inspect_geometry(cfg: XPINNConfig) -> None:
     print(f"lambda={params.lambda_value:.6f}")
     print(f"domain R=[{params.r_min:.10f}, {params.r_max:.10f}] theta=[0, {params.theta_max:.10f}]")
     print(f"groove R=[{params.groove_r_min:.10f}, {params.groove_r_max:.10f}]")
-    print(f"interface_points={len(points)}")
+    print(f"thin_points={len(thin_points)}")
+    print(f"groove_points={len(groove_points)}")
     print(
         format_loss_block(
             stage="geometry_inspect",

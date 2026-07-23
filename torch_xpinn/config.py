@@ -33,34 +33,24 @@ class XPINNConfig:
     # Hard partition
     thin_film: float = 1.0
     groove_film: float = 4.0
-    interface_points: int = 512
     thin_points: int = 2048
     groove_points: int = 2048
     boundary_points: int = 512
-    periodic_points: int = 512
 
-    # Loss weights for the fixed film-thickness interface.
-    thin_pde_weight: float = 1.0
-    groove_pde_weight: float = 1.0
-    interface_pressure_weight: float = 1.0
-    interface_flux_weight: float = 1.0e-3
-    thin_fb_weight: float = 1.0
-    groove_fb_weight: float = 1.0
+    # Simplified loss weights.
+    reynolds_weight: float = 1.0
+    jfo_weight: float = 1.0
     boundary_weight: float = 10.0
-    periodic_weight: float = 1.0
-    fb_epsilon: float = 1.0e-8
-    pressure_ref: float = 0.1
 
     # Optimisation
     seed: int = 20260718
     epochs: int = 20_000
     learning_rate: float = 1.0e-3
     min_learning_rate: float = 1.0e-5
-    scheduler_gamma: float = 0.5
-    scheduler_patience: int = 1_000
     log_interval: int = 100
     checkpoint_interval: int = 1_000
     gradient_clip_norm: float = 1.0
+    use_tqdm: bool = True
 
     # Evaluation
     prediction_batch_size: int = 65_536
@@ -80,7 +70,8 @@ class XPINNConfig:
 
     @classmethod
     def from_dict(cls, values: dict[str, Any]) -> "XPINNConfig":
-        clean = dict(values)
+        valid_keys = set(cls.__dataclass_fields__)
+        clean = {key: value for key, value in values.items() if key in valid_keys}
         if "iou_thresholds" in clean:
             clean["iou_thresholds"] = tuple(clean["iou_thresholds"])
         return cls(**clean)

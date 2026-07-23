@@ -6,16 +6,9 @@ import torch
 
 
 LOSS_ORDER = [
-    "thin_pde",
-    "groove_pde",
-    "interface_pressure",
-    "interface_flux",
-    "thin_fb",
-    "groove_fb",
-    "inner_boundary",
-    "outer_boundary",
-    "periodic_value",
-    "periodic_flux",
+    "reynolds",
+    "jfo",
+    "boundary",
 ]
 
 
