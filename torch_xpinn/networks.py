@@ -69,6 +69,7 @@ class ExpertNet(nn.Module):
         self.r_min = params.r_min
         self.r_max = params.r_max
         self.beta = cfg.softplus_beta
+        # Kept so older checkpoints can still be inspected with this class.
         self.register_buffer(
             "pressure_latent_inner",
             torch.tensor(_softplus_inverse(params.pressure_inner, self.beta)),
@@ -82,11 +83,7 @@ class ExpertNet(nn.Module):
         features = self.features(coords)
         t = (coords[:, 0:1] - self.r_min) / (self.r_max - self.r_min)
         distance = 4.0 * t * (1.0 - t)
-        pressure_latent_bc = (
-            (1.0 - t) * self.pressure_latent_inner
-            + t * self.pressure_latent_outer
-        )
-        pressure_latent = pressure_latent_bc + distance * self.pressure_net(features)
+        pressure_latent = self.pressure_net(features)
         pressure = F.softplus(pressure_latent, beta=self.beta)
         gamma = distance * torch.sigmoid(self.gamma_net(features))
         return pressure, gamma

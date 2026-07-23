@@ -39,7 +39,7 @@ class XPINNConfig:
 
     # Simplified loss weights.
     reynolds_weight: float = 1.0
-    jfo_weight: float = 1.0
+    jfo_weight: float = 1.0e3
     boundary_weight: float = 10.0
 
     # Optimisation

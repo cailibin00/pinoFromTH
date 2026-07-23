@@ -34,6 +34,9 @@ L = w_R * L_Reynolds + w_JFO * L_JFO + w_BC * L_BC
 - `L_JFO`: direct complementarity loss `mean((p * gamma)^2)`.
 - `L_BC`: inner and outer radial pressure boundary loss.
 
+Pressure is not hard-wired to the radial boundary values in the network output.
+It is only constrained by `L_BC`, which keeps the three training terms explicit.
+
 Optimisation is Adam with cosine annealing only.
 
 Current modules:
