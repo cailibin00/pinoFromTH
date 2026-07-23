@@ -164,31 +164,16 @@ def compute_metrics(
         "complementarity_violation_max": float(np.max(p_pred * g_pred)),
         "complementarity_violation_mean": float(np.mean(p_pred * g_pred)),
     }
-    cavitation = g_ref > 1.0e-6
-    full_film = ~cavitation
-    if cavitation.any():
-        metrics["P_rel_L2_cavRegion"] = _rel_l2(
-            p_ref[cavitation], p_pred[cavitation]
-        )
-        metrics["G_rel_L2_cavRegion"] = _rel_l2(
-            g_ref[cavitation], g_pred[cavitation]
-        )
-    if full_film.any():
-        metrics["P_rel_L2_fullRegion"] = _rel_l2(
-            p_ref[full_film], p_pred[full_film]
-        )
-        metrics["G_abs_RMSE_fullRegion"] = float(
-            np.sqrt(np.mean((g_ref[full_film] - g_pred[full_film]) ** 2))
-        )
     eps = np.finfo(float).eps
     for threshold in thresholds:
         ref_mask = g_ref > threshold
         pred_mask = g_pred > threshold
         intersection = np.logical_and(ref_mask, pred_mask).sum()
         union = np.logical_or(ref_mask, pred_mask).sum()
-        iou = intersection / (union + eps)
         dice = 2.0 * intersection / (ref_mask.sum() + pred_mask.sum() + eps)
-        metrics[_threshold_key("cavitation_IoU", threshold)] = float(iou)
+        metrics[_threshold_key("cavitation_IoU", threshold)] = float(
+            intersection / (union + eps)
+        )
         metrics[_threshold_key("cavitation_Dice", threshold)] = float(dice)
     metrics["cavitation_IoU"] = metrics[_threshold_key("cavitation_IoU", 1.0e-6)]
     metrics["cavitation_Dice"] = metrics[_threshold_key("cavitation_Dice", 1.0e-6)]

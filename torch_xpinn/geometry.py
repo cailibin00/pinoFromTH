@@ -64,7 +64,7 @@ def compute_physical_params(cfg: XPINNConfig) -> PhysicalParams:
 
 
 class HardGrooveGeometry:
-    """Hard H=1/H=4 spiral-groove partition, with no sigmoid transition."""
+    """Hard H=1/H=4 spiral-groove partition, with no film transition."""
 
     def __init__(self, cfg: XPINNConfig):
         self.cfg = cfg
@@ -82,8 +82,7 @@ class HardGrooveGeometry:
     def local_theta(self, coords: torch.Tensor) -> torch.Tensor:
         radius = coords[:, 0:1]
         theta = coords[:, 1:2]
-        phase = torch.remainder(theta - self.spiral_theta(radius), self.period)
-        return phase
+        return torch.remainder(theta - self.spiral_theta(radius), self.period)
 
     def groove_mask(self, coords: torch.Tensor) -> torch.Tensor:
         radius = coords[:, 0:1]
@@ -167,3 +166,45 @@ class HardGrooveGeometry:
             (count, 1), device=device, dtype=dtype, generator=generator
         )
         return torch.cat([radius, theta], dim=1)
+
+    def interface_points(
+        self,
+        count: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        half = max(1, count // 2)
+        radius = torch.linspace(
+            self.params.groove_r_min,
+            self.params.groove_r_max,
+            half,
+            device=device,
+            dtype=dtype,
+        ).reshape(-1, 1)
+        theta_entry = torch.remainder(self.spiral_theta(radius), self.period)
+        theta_exit = torch.remainder(
+            self.spiral_theta(radius)
+            + self.params.groove_width_ratio * self.period,
+            self.period,
+        )
+        points = torch.cat(
+            [
+                torch.cat([radius, theta_entry], dim=1),
+                torch.cat([radius, theta_exit], dim=1),
+            ],
+            dim=0,
+        )
+        normals = torch.cat(
+            [
+                self.interface_normal(radius, sign=1.0),
+                self.interface_normal(radius, sign=-1.0),
+            ],
+            dim=0,
+        )
+        return points, normals
+
+    def interface_normal(self, radius: torch.Tensor, sign: float) -> torch.Tensor:
+        dtheta_dr = 1.0 / (radius * self._tan_alpha)
+        normal = torch.cat([-dtheta_dr, torch.ones_like(radius)], dim=1)
+        normal = normal / torch.linalg.vector_norm(normal, dim=1, keepdim=True)
+        return normal * sign

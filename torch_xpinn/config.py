@@ -23,24 +23,31 @@ class XPINNConfig:
     speed_rpm: float = 6_000.0
 
     # Model
-    hidden_width: int = 128
-    hidden_layers: int = 4
+    hidden_width: int = 192
+    hidden_layers: int = 5
     fourier_modes: int = 8
+    spiral_feature_modes: int = 2
+    pressure_scale: float = 0.1
     softplus_beta: float = 20.0
+    hard_pressure_boundary: bool = True
     dtype: str = "float64"
     device: str = "auto"
 
     # Hard partition
     thin_film: float = 1.0
     groove_film: float = 4.0
-    thin_points: int = 2048
-    groove_points: int = 2048
-    boundary_points: int = 512
+    interface_points: int = 1024
+    thin_points: int = 4096
+    groove_points: int = 4096
+    boundary_points: int = 1024
 
-    # Simplified loss weights.
+    # Three public loss terms. Reynolds includes the regional residual and
+    # conservative interface coupling required by discontinuous film thickness.
     reynolds_weight: float = 1.0
-    jfo_weight: float = 1.0e3
-    boundary_weight: float = 10.0
+    jfo_weight: float = 10.0
+    boundary_weight: float = 1.0e3
+    reynolds_interface_pressure_weight: float = 1.0
+    reynolds_interface_flux_weight: float = 1.0e-3
 
     # Optimisation
     seed: int = 20260718

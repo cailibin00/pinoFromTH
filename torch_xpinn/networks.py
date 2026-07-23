@@ -10,25 +10,48 @@ from .config import XPINNConfig
 from .geometry import PhysicalParams, Region
 
 
-class PeriodicFeatures(nn.Module):
-    def __init__(self, params: PhysicalParams, modes: int):
+class GeometryFeatures(nn.Module):
+    def __init__(self, cfg: XPINNConfig, params: PhysicalParams):
         super().__init__()
         self.r_min = params.r_min
         self.r_max = params.r_max
         self.periods = params.periods
-        frequencies = torch.arange(1, modes + 1, dtype=torch.get_default_dtype())
-        self.register_buffer("frequencies", frequencies)
+        self.period = params.theta_max - params.theta_min
+        self.spiral_origin_r = params.spiral_origin_r
+        self.tan_alpha = math.tan(params.spiral_angle_rad)
+        self.theta_offset = math.pi / 6.0
+        theta_freq = torch.arange(1, cfg.fourier_modes + 1)
+        spiral_freq = torch.arange(1, cfg.spiral_feature_modes + 1)
+        self.register_buffer("theta_freq", theta_freq.to(torch.get_default_dtype()))
+        self.register_buffer("spiral_freq", spiral_freq.to(torch.get_default_dtype()))
 
     @property
     def output_dim(self) -> int:
-        return 1 + 2 * len(self.frequencies)
+        # rho, raw phase, theta Fourier pairs, spiral phase Fourier pairs
+        return 2 + 2 * len(self.theta_freq) + 2 * len(self.spiral_freq)
 
     def forward(self, coords: torch.Tensor) -> torch.Tensor:
         radius = coords[:, 0:1]
         theta = coords[:, 1:2]
         rho = 2.0 * (radius - self.r_min) / (self.r_max - self.r_min) - 1.0
-        phase = theta * self.periods * self.frequencies.view(1, -1)
-        return torch.cat([rho, torch.sin(phase), torch.cos(phase)], dim=1)
+        theta_phase = theta * self.periods * self.theta_freq.view(1, -1)
+        spiral_theta = (
+            torch.log(radius / self.spiral_origin_r) / self.tan_alpha
+            + self.theta_offset
+        )
+        local_phase = torch.remainder(theta - spiral_theta, self.period) / self.period
+        spiral_phase = 2.0 * math.pi * local_phase * self.spiral_freq.view(1, -1)
+        return torch.cat(
+            [
+                rho,
+                2.0 * local_phase - 1.0,
+                torch.sin(theta_phase),
+                torch.cos(theta_phase),
+                torch.sin(spiral_phase),
+                torch.cos(spiral_phase),
+            ],
+            dim=1,
+        )
 
 
 class MLP(nn.Module):
@@ -59,7 +82,8 @@ def _softplus_inverse(value: float, beta: float) -> float:
 class ExpertNet(nn.Module):
     def __init__(self, cfg: XPINNConfig, params: PhysicalParams):
         super().__init__()
-        self.features = PeriodicFeatures(params, cfg.fourier_modes)
+        self.cfg = cfg
+        self.features = GeometryFeatures(cfg, params)
         self.pressure_net = MLP(
             self.features.output_dim, cfg.hidden_width, cfg.hidden_layers, 1
         )
@@ -69,7 +93,7 @@ class ExpertNet(nn.Module):
         self.r_min = params.r_min
         self.r_max = params.r_max
         self.beta = cfg.softplus_beta
-        # Kept so older checkpoints can still be inspected with this class.
+        self.pressure_scale = cfg.pressure_scale
         self.register_buffer(
             "pressure_latent_inner",
             torch.tensor(_softplus_inverse(params.pressure_inner, self.beta)),
@@ -83,7 +107,17 @@ class ExpertNet(nn.Module):
         features = self.features(coords)
         t = (coords[:, 0:1] - self.r_min) / (self.r_max - self.r_min)
         distance = 4.0 * t * (1.0 - t)
-        pressure_latent = self.pressure_net(features)
+        pressure_raw = self.pressure_net(features)
+        if self.cfg.hard_pressure_boundary:
+            pressure_latent_bc = (
+                (1.0 - t) * self.pressure_latent_inner
+                + t * self.pressure_latent_outer
+            )
+            pressure_latent = (
+                pressure_latent_bc + self.pressure_scale * distance * pressure_raw
+            )
+        else:
+            pressure_latent = pressure_raw
         pressure = F.softplus(pressure_latent, beta=self.beta)
         gamma = distance * torch.sigmoid(self.gamma_net(features))
         return pressure, gamma

@@ -10,7 +10,7 @@ from .config import XPINNConfig
 from .geometry import HardGrooveGeometry, Region, compute_physical_params
 from .logging import format_loss_block, scalar, weighted_total
 from .networks import XPINNModel
-from .physics import region_jfo_loss, region_reynolds_loss
+from .physics import interface_reynolds_loss, region_jfo_loss, region_reynolds_loss
 
 try:
     from tqdm.auto import tqdm
@@ -92,6 +92,9 @@ class XPINNTrainer:
     def losses(self) -> dict[str, torch.Tensor]:
         thin_points = self._region_points(Region.THIN, self.cfg.thin_points)
         groove_points = self._region_points(Region.GROOVE, self.cfg.groove_points)
+        interface_points, normals = self.geometry.interface_points(
+            self.cfg.interface_points, self.device, self.dtype
+        )
 
         reynolds = torch.stack(
             [
@@ -100,6 +103,9 @@ class XPINNTrainer:
                 ),
                 region_reynolds_loss(
                     self.model, self.geometry, groove_points, Region.GROOVE
+                ),
+                interface_reynolds_loss(
+                    self.model, self.geometry, interface_points, normals
                 ),
             ]
         ).mean()
